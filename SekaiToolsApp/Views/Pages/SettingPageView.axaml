@@ -175,6 +175,11 @@
                                 <Slider Grid.Column="1" Minimum="0.1" Maximum="1" SmallChange="0.01" LargeChange="0.05" TickFrequency="0.05" Value="{Binding ThresholdMarkerNormal, Mode=TwoWay}"/>
                                 <TextBlock Grid.Column="2" Text="{Binding ThresholdMarkerNormal, StringFormat={}{0:F2}}" VerticalAlignment="Center"/>
                             </Grid>
+                            <Grid ColumnDefinitions="130,*,50">
+                                <TextBlock Grid.Column="0" Text="掉帧容忍(秒)" VerticalAlignment="Center" ToolTip.Tip="对话已上屏后，匹配短暂掉到阈值以下时继续保留这一行的时长。越大越能避免轴提前结束（覆盖不到全行），但过大可能让下一句起点略微延后。0=关闭"/>
+                                <Slider Grid.Column="1" Minimum="0" Maximum="1" SmallChange="0.05" LargeChange="0.1" TickFrequency="0.05" Value="{Binding DialogDropGraceSeconds, Mode=TwoWay}"/>
+                                <TextBlock Grid.Column="2" Text="{Binding DialogDropGraceSeconds, StringFormat={}{0:F2}}" VerticalAlignment="Center"/>
+                            </Grid>
                         </StackPanel>
                     </Grid>
                 </Border>

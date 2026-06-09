@@ -30,6 +30,19 @@ public class DialogTemplateMatcher(
     private const double AbsMinThreshold = 0.40;
     private int FallbackTriggerFrames => (int)Math.Ceiling(videoInfo.Fps.Fps() * 0.5);
 
+    // Grace window for a dialog that is *already on screen* (has matched frames) but
+    // momentarily fails to match — flicker, dialog-box shake, a brief overlay. Without
+    // this, a single sub-threshold frame ends the line early and the subtitle stops
+    // before the dialog actually disappears ("covers不到全行"). During the window we
+    // retry with the fallback threshold and buffer the frames; if matching recovers we
+    // commit them so the timeline spans the gap, otherwise we discard them and finalize
+    // at the last real match (no spurious tail on genuinely-ended dialogs).
+    private int _droppedGrace;
+    private MatchStatus _lastMatchedStatus;
+    private readonly List<(int Index, Point Point)> _pendingFrames = [];
+    private int DroppedGraceFrames =>
+        (int)Math.Ceiling(videoInfo.Fps.Fps() * Math.Max(0, config.MatchingThreshold.DialogDropGraceSeconds));
+
     public bool Finished => Set.All(d => d.Finished) || Set.Count == 0;
 
     private GaMat GetNameTag(string name)
@@ -271,6 +284,8 @@ public class DialogTemplateMatcher(
                 _lastFailedIndex = dIndex;
                 _consecutiveFailures = 0;
                 _useFallbackThreshold = false;
+                _droppedGrace = 0;
+                _pendingFrames.Clear();
             }
 
             var dialogRefers = Set[dIndex];
@@ -281,7 +296,24 @@ public class DialogTemplateMatcher(
             switch (_status)
             {
                 case MatchStatus.DialogDropped:
+                    // Finalize immediately only if the dialog never started, or the
+                    // grace window is exhausted. While a tracked dialog is still inside
+                    // the window, keep it alive: buffer this frame at the last known
+                    // position, drop the threshold, and restore the matched status so
+                    // the next frame retries the same template. Transient noise no
+                    // longer truncates the line before it is fully shown.
+                    if (!Set[dIndex].IsEmpty() && _droppedGrace < DroppedGraceFrames)
+                    {
+                        _droppedGrace++;
+                        _pendingFrames.Add((frameIndex, Set[dIndex].End().Point));
+                        _useFallbackThreshold = true;
+                        _status = _lastMatchedStatus;
+                        return IsStatusMatched(_lastMatchedStatus);
+                    }
+
                     Set[dIndex].Finished = true;
+                    _droppedGrace = 0;
+                    _pendingFrames.Clear();
                     _consecutiveFailures = 0;
                     _useFallbackThreshold = false;
                     TemplateMatchCachePool.NextDialog();
@@ -297,7 +329,18 @@ public class DialogTemplateMatcher(
                     _useFallbackThreshold = false;
                     return IsStatusMatched(firstStatus.Value);
                 default:
+                    // Real match (possibly a recovery after a dropped streak): commit
+                    // any frames buffered during the grace window first, so the dialog
+                    // spans the transient gap, then add this frame.
+                    if (_pendingFrames.Count > 0)
+                    {
+                        foreach (var (idx, pt) in _pendingFrames) Set[dIndex].Add(idx, pt);
+                        _pendingFrames.Clear();
+                    }
+
                     Set[dIndex].Add(frameIndex, matchResult.Point);
+                    _lastMatchedStatus = _status;
+                    _droppedGrace = 0;
                     _consecutiveFailures = 0;
                     _useFallbackThreshold = false;
                     return IsStatusMatched(firstStatus.Value);

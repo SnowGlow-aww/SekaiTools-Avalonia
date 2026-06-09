@@ -104,6 +104,7 @@ public partial class SettingPageViewModel : ViewModelBase
     [ObservableProperty] private double _thresholdDialogContentSpecial = 0.70;
     [ObservableProperty] private double _thresholdBannerNormal = 0.50;
     [ObservableProperty] private double _thresholdMarkerNormal = 0.50;
+    [ObservableProperty] private double _dialogDropGraceSeconds = 0.30;
     [ObservableProperty] private string _proxyPortError = "";
     [ObservableProperty] private string _typewriterCharTimeError = "";
     [ObservableProperty] private string _typewriterFadeTimeError = "";
@@ -152,6 +153,7 @@ public partial class SettingPageViewModel : ViewModelBase
             ThresholdDialogContentSpecial = s.ThresholdDialogContentSpecial;
             ThresholdBannerNormal = s.ThresholdBannerNormal;
             ThresholdMarkerNormal = s.ThresholdMarkerNormal;
+            DialogDropGraceSeconds = s.DialogDropGraceSeconds;
         }
         finally
         {
@@ -190,6 +192,7 @@ public partial class SettingPageViewModel : ViewModelBase
         s.ThresholdDialogContentSpecial = ThresholdDialogContentSpecial;
         s.ThresholdBannerNormal = ThresholdBannerNormal;
         s.ThresholdMarkerNormal = ThresholdMarkerNormal;
+        s.DialogDropGraceSeconds = DialogDropGraceSeconds;
         _settings.Save();
     }
 

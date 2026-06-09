@@ -297,6 +297,7 @@ public partial class SubtitlePageViewModel : ViewModelBase
                 DialogContentSpecial = appSettings.ThresholdDialogContentSpecial,
                 BannerNormal = appSettings.ThresholdBannerNormal,
                 MarkerNormal = appSettings.ThresholdMarkerNormal,
+                DialogDropGraceSeconds = appSettings.DialogDropGraceSeconds,
             }
         );
     }

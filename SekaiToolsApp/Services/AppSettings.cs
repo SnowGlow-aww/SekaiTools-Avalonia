@@ -47,6 +47,11 @@ public sealed class AppSettings
     public double ThresholdBannerNormal { get; set; } = 0.50;
     public double ThresholdMarkerNormal { get; set; } = 0.50;
 
+    // Grace window (seconds) for keeping an on-screen dialog alive when template
+    // matching briefly drops below threshold (flicker/shake). Prevents the auto
+    // timeline from ending a line early ("覆盖不到全行"). 0 disables the grace.
+    public double DialogDropGraceSeconds { get; set; } = 0.30;
+
     public static AppSettings CreateDefault() => new();
 
     public AppSettings Clone()
@@ -81,6 +86,7 @@ public sealed class AppSettings
             ThresholdDialogContentSpecial = ThresholdDialogContentSpecial,
             ThresholdBannerNormal = ThresholdBannerNormal,
             ThresholdMarkerNormal = ThresholdMarkerNormal,
+            DialogDropGraceSeconds = DialogDropGraceSeconds,
         };
     }
 
