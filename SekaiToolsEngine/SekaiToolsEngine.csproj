@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+    <PropertyGroup>
+        <OutputType>Exe</OutputType>
+        <TargetFramework>net10.0</TargetFramework>
+        <ImplicitUsings>enable</ImplicitUsings>
+        <Nullable>enable</Nullable>
+        <RootNamespace>SekaiToolsEngine</RootNamespace>
+        <RuntimeIdentifiers>osx-arm64;win-x64</RuntimeIdentifiers>
+        <PublishSingleFile>true</PublishSingleFile>
+        <SelfContained>true</SelfContained>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <ProjectReference Include="..\SekaiToolsCore\SekaiToolsCore.csproj" />
+        <ProjectReference Include="..\SekaiToolsBase\SekaiToolsBase.csproj" />
+        <ProjectReference Include="..\SekaiDataFetch\SekaiDataFetch.csproj" />
+        <ProjectReference Include="..\SekaiToolsPlatform\SekaiToolsPlatform.csproj" />
+    </ItemGroup>
+
+    <ItemGroup>
+        <Compile Include="..\SekaiToolsApp\Services\Suppressor.cs" Link="Shared\Suppressor.cs" />
+        <Compile Include="..\SekaiToolsApp\Services\SuppressRuntimeService.cs" Link="Shared\SuppressRuntimeService.cs" />
+        <Compile Include="..\SekaiToolsApp\Services\X264Params.cs" Link="Shared\X264Params.cs" />
+        <Compile Include="..\SekaiToolsApp\Services\EncoderConfig.cs" Link="Shared\EncoderConfig.cs" />
+    </ItemGroup>
+
+</Project>
