@@ -23,10 +23,10 @@ public static class TemplateMatcher
             img = imgOriginal;
 
         var pool = TemplateMatchCachePool.GetPool(usage);
-        if (pool.Query(img)) return pool.prevResult;
+        if (pool.Query(img, tmp.Size)) return pool.prevResult;
 
         var res = MatchNoCache(img, tmp, matchingType, memberName);
-        pool.RegisterResult(img, res);
+        pool.RegisterResult(img, tmp.Size, res);
 
         return res;
     }

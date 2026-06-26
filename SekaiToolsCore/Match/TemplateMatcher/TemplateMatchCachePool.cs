@@ -1,4 +1,5 @@
-﻿using Emgu.CV;
+﻿using System.Drawing;
+using Emgu.CV;
 using Emgu.CV.CvEnum;
 
 namespace SekaiToolsCore.Match.TemplateMatcher;
@@ -21,6 +22,7 @@ public class TemplateMatchCachePool
     public Mat diffMat;
 
     public Mat? prevImg;
+    public Size prevTemplateSize;
     public TemplateMatchResult prevResult;
 
     public TemplateMatchCachePool()
@@ -55,15 +57,19 @@ public class TemplateMatchCachePool
         GlobalPool[(int)MatchUsage.DialogContent3].Reset();
     }
 
-    public void RegisterResult(Mat img, TemplateMatchResult result)
+    public void RegisterResult(Mat img, Size templateSize, TemplateMatchResult result)
     {
         prevImg = img;
+        prevTemplateSize = templateSize;
         prevResult = result;
     }
 
-    public bool Query(Mat img)
+    public bool Query(Mat img, Size templateSize)
     {
         if (img == null || prevImg == null) return false;
+
+        // 模板变了(不同文本/不同尺寸)就不能复用上一帧的分数——即使搜索图相同
+        if (templateSize != prevTemplateSize) return false;
 
         // treat two empty mat as identical as well
         if (img.IsEmpty && prevImg.IsEmpty) return true;

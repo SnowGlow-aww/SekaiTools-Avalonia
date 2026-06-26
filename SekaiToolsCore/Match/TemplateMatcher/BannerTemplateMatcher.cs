@@ -68,8 +68,8 @@ public class BannerTemplateMatcher(
             cropArea.Limit(new Rectangle(Point.Empty, src.Size));
             if (cropArea.IsEmpty || cropArea.Width < tmp.Size.Width || cropArea.Height < tmp.Size.Height) return false;
             var imgCropped = new Mat(src, cropArea);
-            MatProcessor.LaplaceSharpen(imgCropped);
-            // imgCropped
+            // 旧版无任何预滤波；原 LaplaceSharpen(beta=0) 实为空操作(只附带一次灰度转换)，
+            // 而 TemplateMatcher.Match 已会按需做 Bgr2Gray，故移除以保持与 1.3.3 一致。
             var result = TemplateMatcher.Match(imgCropped, tmp, TemplateMatchCachePool.MatchUsage.Banner);
 
             if (frameIndex != -1)

@@ -187,7 +187,10 @@ public class VideoProcessor
 
         var avgDuration = 0d;
         var frameIndex = 0;
-        var skipFrames = Math.Max(1, (int)(frameRate / 30)); // 等效 30fps 采样
+        // 还原 1.3.3 的逐帧读取(不跳帧)。原"智能降频采样"的触发条件恰好是"对话进行中"，
+        // 会在打字机动画与对话结束边界丢帧，把时间轴打粗(≥60fps 尤其明显)，因此默认关闭。
+        // 如需提速，应改成仅在"无任何对话/横幅/地标活动的静止段"跳帧,而非对话进行中。
+        var skipFrames = 1; // = 1 即不跳帧
         var stableCount = 0;
         const int StableThreshold = 5;
         while (true)
@@ -238,7 +241,10 @@ public class VideoProcessor
                     var dialogIndex = DialogMatcher.LastNotProcessedIndex();
                     var r = DialogMatcher.Process(frame, frameIndex);
                     matchBannerNow = !r;
-                    if (DialogMatcher.Set[dialogIndex].Finished) Callbacks.OnNewDialog(DialogMatcher.Set[dialogIndex]);
+                    // 跳过的对话会被标记 Finished 但为空集；空集不发卡片/不产字幕(StartIndex 会抛)。
+                    if (DialogMatcher.Set[dialogIndex] is { Finished: true, } finishedDialog &&
+                        !finishedDialog.IsEmpty())
+                        Callbacks.OnNewDialog(finishedDialog);
                 }
                 else if (_debugIgnoreBannerMarker)
                 {

@@ -40,12 +40,13 @@ public sealed class AppSettings
     public bool ExportMarkerText { get; set; } = true;
     public bool ExportScreenComment { get; set; } = true;
 
-    public double ThresholdDialogNametagNormal { get; set; } = 0.70;
-    public double ThresholdDialogNametagSpecial { get; set; } = 0.70;
-    public double ThresholdDialogContentNormal { get; set; } = 0.70;
-    public double ThresholdDialogContentSpecial { get; set; } = 0.70;
-    public double ThresholdBannerNormal { get; set; } = 0.50;
-    public double ThresholdMarkerNormal { get; set; } = 0.50;
+    // 默认阈值与 1.3.3 对齐(普通 0.80 / 抖动-特殊 0.60)，模板渲染已忠实复刻旧版。
+    public double ThresholdDialogNametagNormal { get; set; } = 0.80;
+    public double ThresholdDialogNametagSpecial { get; set; } = 0.60;
+    public double ThresholdDialogContentNormal { get; set; } = 0.80;
+    public double ThresholdDialogContentSpecial { get; set; } = 0.60;
+    public double ThresholdBannerNormal { get; set; } = 0.80;
+    public double ThresholdMarkerNormal { get; set; } = 0.80;
 
     // Grace window (seconds) for keeping an on-screen dialog alive when template
     // matching briefly drops below threshold (flicker/shake). Prevents the auto

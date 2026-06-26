@@ -15,8 +15,8 @@ public class GaMat // Gray and Alpha Mat
         var alphaChannel = new Mat();
         CvInvoke.CvtColor(src, grayImage, ColorConversion.Bgra2Gray);
         CvInvoke.ExtractChannel(src, alphaChannel, 3);
-        // Binarize alpha to match GDI+ behavior (no partial transparency)
-        CvInvoke.Threshold(alphaChannel, alphaChannel, 127, 255, ThresholdType.Binary);
+        // 还原 1.3.3：保留抗锯齿的软 alpha 作为掩膜权重，不做 127 二值化。
+        // 模板渲染几何已忠实复刻旧版后，软 alpha 与旧版掩膜覆盖一致，匹配峰值更高更稳。
         if (resize)
         {
             const int scaleRatio = 5;

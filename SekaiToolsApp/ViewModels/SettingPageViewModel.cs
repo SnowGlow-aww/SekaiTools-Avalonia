@@ -98,12 +98,12 @@ public partial class SettingPageViewModel : ViewModelBase
     [ObservableProperty] private bool _exportMarkerMask;
     [ObservableProperty] private bool _exportMarkerText;
     [ObservableProperty] private bool _exportScreenComment;
-    [ObservableProperty] private double _thresholdDialogNametagNormal = 0.70;
-    [ObservableProperty] private double _thresholdDialogNametagSpecial = 0.70;
-    [ObservableProperty] private double _thresholdDialogContentNormal = 0.70;
-    [ObservableProperty] private double _thresholdDialogContentSpecial = 0.70;
-    [ObservableProperty] private double _thresholdBannerNormal = 0.50;
-    [ObservableProperty] private double _thresholdMarkerNormal = 0.50;
+    [ObservableProperty] private double _thresholdDialogNametagNormal = 0.80;
+    [ObservableProperty] private double _thresholdDialogNametagSpecial = 0.60;
+    [ObservableProperty] private double _thresholdDialogContentNormal = 0.80;
+    [ObservableProperty] private double _thresholdDialogContentSpecial = 0.60;
+    [ObservableProperty] private double _thresholdBannerNormal = 0.80;
+    [ObservableProperty] private double _thresholdMarkerNormal = 0.80;
     [ObservableProperty] private double _dialogDropGraceSeconds = 0.30;
     [ObservableProperty] private string _proxyPortError = "";
     [ObservableProperty] private string _typewriterCharTimeError = "";
