@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -203,8 +204,32 @@ public sealed partial class Suppressor : IDisposable
         var canceled = false;
         try
         {
-            if (_vProcess != null) await _vProcess.WaitForExitAsync().ConfigureAwait(false);
-            if (_fProcess != null) await _fProcess.WaitForExitAsync().ConfigureAwait(false);
+            var monitored = new List<Process>(2);
+            if (_vProcess != null) monitored.Add(_vProcess);
+            if (_fProcess != null) monitored.Add(_fProcess);
+
+            if (monitored.Count > 0)
+            {
+                var waits = new Task[monitored.Count];
+                for (var i = 0; i < monitored.Count; i++)
+                    waits[i] = monitored[i].WaitForExitAsync();
+
+                // 等第一个子进程退出。任一子进程（ffmpeg _fProcess 或 VSPipe _vProcess）
+                // 异常退出（非 0）时，主动 Kill 仍在跑的另一个，确保它的 WaitForExitAsync
+                // 也能返回——否则 ffmpeg 中途死亡后 VSPipe 不回收、管道不关闭会永挂。
+                // 正常完成时 VSPipe 先 EOF 退出(0)、ffmpeg 仍在收尾编码，此处不 Kill，
+                // 成功路径不受影响。
+                var firstDone = await Task.WhenAny(waits).ConfigureAwait(false);
+                var firstIdx = Array.IndexOf(waits, firstDone);
+                if (firstIdx >= 0 && ExitedWithFailure(monitored[firstIdx]))
+                {
+                    for (var i = 0; i < monitored.Count; i++)
+                        if (i != firstIdx) TryKill(monitored[i]);
+                }
+
+                for (var i = 0; i < waits.Length; i++)
+                    await waits[i].ConfigureAwait(false);
+            }
 
             if (_logTask != null)
             {
@@ -260,6 +285,19 @@ public sealed partial class Suppressor : IDisposable
             return null;
 
         return new InvalidOperationException(string.Join(Environment.NewLine, failures));
+    }
+
+    private static bool ExitedWithFailure(Process process)
+    {
+        try
+        {
+            return process.HasExited && process.ExitCode != 0;
+        }
+        catch (InvalidOperationException)
+        {
+            // 进程已释放时读取 ExitCode 可能失败，按"无失败"处理。
+            return false;
+        }
     }
 
     private static void AppendExitFailure(Process? process, string name, ICollection<string> failures)
@@ -334,8 +372,21 @@ public sealed partial class Suppressor : IDisposable
         if (FfmpegProgressPattern().IsMatch(log))
         {
             var match = FfmpegProgressPattern().Match(log);
-            _frameCount = int.Parse(match.Groups["FrameNumber"].Value);
-            _fps = double.Parse(match.Groups["FramesPerSecond"].Value);
+            // ffmpeg 进度数字始终是 invariant 格式；用 InvariantCulture + TryParse 避免
+            // 欧洲逗号区把 "fps=23.5" 解析错，且解析失败时不抛（FormatException 会逃出
+            // RunLogReader 的窄 catch 导致挂死）——失败就当普通日志行处理、跳过本次进度更新。
+            if (!int.TryParse(match.Groups["FrameNumber"].Value, NumberStyles.Integer,
+                    CultureInfo.InvariantCulture, out var frameNumber) ||
+                !double.TryParse(match.Groups["FramesPerSecond"].Value, NumberStyles.Float,
+                    CultureInfo.InvariantCulture, out var framesPerSecond))
+            {
+                _callbacks.OnLogLine?.Invoke(log);
+                _lastLogLineWasProgress = false;
+                return;
+            }
+
+            _frameCount = frameNumber;
+            _fps = framesPerSecond;
 
             // 进度行用 OnProgressLogLine 替换上一行，避免日志窗口被进度刷屏。
             if (_lastLogLineWasProgress)
@@ -486,9 +537,19 @@ public sealed partial class Suppressor : IDisposable
             return null;
 
         var escaped = EscapeFfmpegFilterValue(Path.GetFullPath(_options.SourceSubtitle));
-        return $"subtitles=filename='{escaped}'";
+        return $"subtitles=filename={escaped}";
     }
 
+    /// <summary>
+    /// 为 ffmpeg 滤镜图里的 <c>subtitles=filename=…</c> 值做转义。
+    ///
+    /// libavfilter 解析滤镜串有两层转义：先是整条滤镜描述（特殊字符 <c>[ ] , ;</c> 与转义符
+    /// <c>\ '</c>），再是单个选项值（分隔符 <c>:</c> 与转义符 <c>\ '</c>）。单层用单引号包裹
+    /// 无法同时穿过两层——尤其撇号 <c>'</c> 在内层会被当作引号提前闭合，导致路径被截断、
+    /// libass 报 "Unable to open" 整条压制失败（exit 254）。因此这里不再包裹引号，而是按字符
+    /// 同时为两层做转义。各分支的字节数都已用打包同款 ffmpeg 实测过含
+    /// 撇号 / 空格 / 方括号 / 逗号 / 分号 / 等号 / 中文 的路径。
+    /// </summary>
     private static string EscapeFfmpegFilterValue(string value)
     {
         var normalized = value.Replace('\\', '/');
@@ -497,12 +558,20 @@ public sealed partial class Suppressor : IDisposable
         {
             switch (ch)
             {
-                case '\\':
                 case '\'':
+                    // 两层都把 ' 当转义/引号字符：内层需 \' ，外层再把这两个字符转义
+                    // → 最终字节为 \\\' （三反斜杠 + 撇号）。
+                    builder.Append("\\\\\\'");
+                    break;
                 case ':':
+                    // : 仅是内层（选项值）的分隔符；外层把 \ 转义后交给内层 → \\: 。
+                    builder.Append("\\\\:");
+                    break;
                 case ',':
+                case ';':
                 case '[':
                 case ']':
+                    // 仅是外层（滤镜描述）的特殊字符，外层单反斜杠转义即可。
                     builder.Append('\\');
                     builder.Append(ch);
                     break;

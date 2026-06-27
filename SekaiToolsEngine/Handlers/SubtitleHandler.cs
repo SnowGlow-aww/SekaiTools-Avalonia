@@ -29,7 +29,7 @@ public sealed class SubtitleHandler
         dispatcher.Register("subtitle.export", ExportAsync);
     }
 
-    private Task<object?> StartAsync(JsonElement? @params)
+    private async Task<object?> StartAsync(JsonElement? @params)
     {
         if (@params == null) throw new ArgumentException("params required");
         var p = @params.Value;
@@ -53,6 +53,18 @@ public sealed class SubtitleHandler
             };
         }
 
+        // 干净机器首跑：VideoProcessor 依赖 VideoProcess 模板/字体资源。尽力联网确保（Check + 按需下载），
+        // 但联网失败不阻断——只要本地已有资源（老用户/离线）仍可继续；真正缺失则在构造时给清晰错误。
+        try
+        {
+            await ResourceManager.Instance.EnsureResource(ResourceType.VideoProcess);
+        }
+        catch
+        {
+            // 拿文件清单/下载失败（多为离线）：忽略，改用本地已有资源继续。
+            // 若资源其实缺失，下面 new VideoProcessor 会抛出并转成清晰错误。
+        }
+
         var config = new Config(videoPath, scriptPath, translatePath, matchingThreshold: threshold);
         var callbacks = BuildCallbacks();
 
@@ -62,10 +74,19 @@ public sealed class SubtitleHandler
             _dialogs.Clear();
             _banners.Clear();
             _markers.Clear();
-            _processor = new VideoProcessor(config, callbacks);
+            try
+            {
+                _processor = new VideoProcessor(config, callbacks);
+            }
+            catch (Exception ex)
+            {
+                throw new InvalidOperationException(
+                    $"打轴模板/字体资源缺失，且无法联网下载；请联网首次运行以下载 VideoProcess 资源：{ex.Message}", ex);
+            }
         }
 
-        Task.Run(() =>
+        // 刻意 fire-and-forget：start 语义是"立即回 ok 再后台流式跑"，不等长任务完成。
+        _ = Task.Run(() =>
         {
             try
             {
@@ -77,7 +98,7 @@ public sealed class SubtitleHandler
             }
         });
 
-        return Task.FromResult<object?>("ok");
+        return "ok";
     }
 
     private Task<object?> StopAsync(JsonElement? @params)
