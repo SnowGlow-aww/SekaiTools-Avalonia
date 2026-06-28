@@ -14,6 +14,7 @@ public sealed class DownloadHandler
     private const string SourceListUrl = "https://config.g.xbb.moe/source.json";
     private readonly IpcTransport _transport;
     private SourceData[] _allSources;
+    private SourceData _currentSource; // tracked locally because SourceList.SourceData is write-only
 
     private static readonly SourceData MoesekaiJp = new()
     {
@@ -43,6 +44,7 @@ public sealed class DownloadHandler
     {
         _transport = transport;
         _allSources = BuildDefaultSources();
+        _currentSource = _allSources[0];
     }
 
     private static SourceData[] BuildDefaultSources()
@@ -94,17 +96,42 @@ public sealed class DownloadHandler
         if (@params == null) throw new ArgumentException("params required");
         var p = @params.Value;
         var index = p.TryGetProperty("index", out var idx) ? idx.GetInt32() : 0;
-        if (index >= 0 && index < _allSources.Length)
+        // Validate instead of silently no-op'ing on a bad index (which previously still
+        // returned "ok", leaving the caller running against the wrong/old source).
+        if (index < 0 || index >= _allSources.Length)
+            throw new ArgumentException($"Source index out of range: {index} (have {_allSources.Length})");
+
+        var source = _allSources[index];
+        _currentSource = source;
+        Fetcher.Instance.SetSource(source);
+        SourceList.Instance.SourceData = source;
+        ListUnitStory.Instance.SetSource(source);
+        ListEventStory.Instance.SetSource(source);
+        ListSpecialStory.Instance.SetSource(source);
+        ListCardStory.Instance.SetSource(source);
+        ListActionStory.Instance.SetSource(source);
+        ListGreetStory.Instance.SetSource(source);
+
+        // Optional proxy {type:0=None|1=Http|2=Socks5, host, port}. Apply to the fetcher and every
+        // list singleton so headless downloads honor the user's proxy (previously never applied).
+        if (p.TryGetProperty("proxy", out var pr) && pr.ValueKind == JsonValueKind.Object)
         {
-            var source = _allSources[index];
-            Fetcher.Instance.SetSource(source);
-            SourceList.Instance.SourceData = source;
-            ListUnitStory.Instance.SetSource(source);
-            ListEventStory.Instance.SetSource(source);
-            ListSpecialStory.Instance.SetSource(source);
-            ListCardStory.Instance.SetSource(source);
-            ListActionStory.Instance.SetSource(source);
-            ListGreetStory.Instance.SetSource(source);
+            var ptype = pr.TryGetProperty("type", out var pt) ? pt.GetInt32() : 0;
+            var phost = pr.TryGetProperty("host", out var ph) ? ph.GetString() ?? "" : "";
+            var pport = pr.TryGetProperty("port", out var pp) ? pp.GetInt32() : 0;
+            var proxy = new Proxy(phost, pport, ptype switch
+            {
+                1 => Proxy.Type.Http,
+                2 => Proxy.Type.Socks5,
+                _ => Proxy.Type.None,
+            });
+            Fetcher.Instance.SetProxy(proxy);
+            ListUnitStory.Instance.SetProxy(proxy);
+            ListEventStory.Instance.SetProxy(proxy);
+            ListSpecialStory.Instance.SetProxy(proxy);
+            ListCardStory.Instance.SetProxy(proxy);
+            ListActionStory.Instance.SetProxy(proxy);
+            ListGreetStory.Instance.SetProxy(proxy);
         }
         return Task.FromResult<object?>("ok");
     }
@@ -184,10 +211,21 @@ public sealed class DownloadHandler
 
         var total = items.GetArrayLength();
         var done = 0;
+        var failed = 0;
 
         foreach (var item in items.EnumerateArray())
         {
-            var url = item.GetProperty("url").GetString()!;
+            var url = item.GetProperty("url").GetString() ?? "";
+            var title = item.TryGetProperty("title", out var t) ? t.GetString() : null;
+
+            // A candidate with no resolvable URL is a failure, not silent success.
+            if (string.IsNullOrWhiteSpace(url))
+            {
+                failed++;
+                _transport.SendNotification("download.error", new { title = title ?? "", error = "下载地址为空" });
+                continue;
+            }
+
             var fileName = Path.GetFileName(url);
             var savePath = Path.Combine(saveDirBase, fileName);
             Directory.CreateDirectory(saveDirBase);
@@ -195,28 +233,38 @@ public sealed class DownloadHandler
             try
             {
                 var content = await Fetcher.Instance.Fetch(url);
+                // Fetcher.Fetch returns the "{}" sentinel (NOT an exception) after exhausting retries
+                // on HTTP/network failure; writing it leaves a 2-byte file that downstream parses as
+                // 0 entries (masquerading as a recognition failure). Treat the sentinel / empty body
+                // as a real failure instead of reporting success.
+                if (string.IsNullOrWhiteSpace(content) || content.Trim() == "{}")
+                {
+                    failed++;
+                    _transport.SendNotification("download.error", new { title = title ?? fileName, error = "下载失败（空响应 / HTTP 错误）" });
+                    continue;
+                }
                 await File.WriteAllTextAsync(savePath, content);
                 done++;
                 _transport.SendNotification("download.progress", new
                 {
-                    done, total,
-                    title = item.TryGetProperty("title", out var t) ? t.GetString() : fileName,
+                    done, total, failed,
+                    title = title ?? fileName,
                     path = savePath,
                 });
             }
             catch (Exception ex)
             {
+                failed++;
                 _transport.SendNotification("download.error", new
                 {
-                    title = item.TryGetProperty("title", out var t) ? t.GetString() : fileName,
+                    title = title ?? fileName,
                     error = ex.Message,
                 });
-                done++;
             }
         }
 
-        _transport.SendNotification("download.finished", new { done, total });
-        return new { done, total };
+        _transport.SendNotification("download.finished", new { done, total, failed });
+        return new { done, total, failed };
     }
 
     private object[] BuildCandidates(int storyTypeIndex, string? filter)
@@ -353,6 +401,7 @@ public sealed class DownloadHandler
         if (data.Count == 0) return [];
         var charId = int.TryParse(characterIdStr, out var cid) ? cid : 1;
 
+        var baseUrl = _currentSource.StorageBaseUrl ?? "";
         return data
             .Where(d => d.CharacterId == charId)
             .OrderByDescending(d => d.PublishedAt)
@@ -360,10 +409,18 @@ public sealed class DownloadHandler
             {
                 var serif = item.Serif.Replace("\n", " ");
                 if (serif.Length > 40) serif = serif[..40] + "...";
+                // Port the GUI's BuildGreetVoiceUrl so greet voices have a real URL (was "" ->
+                // every greet item silently "failed"). Empty base falls through to FetchCandidates'
+                // empty-url guard, which now reports a failure instead of faking success.
+                var url = string.IsNullOrEmpty(baseUrl)
+                    ? ""
+                    : baseUrl.Contains("sekai.best", StringComparison.OrdinalIgnoreCase)
+                        ? baseUrl + $"sound/systemvoice/{item.AssetbundleName}/{item.Voice}.mp3"
+                        : baseUrl + $"startapp/sound/systemvoice/{item.AssetbundleName}/{item.Voice}.mp3";
                 return (object)new
                 {
                     title = $"[{item.Voice}] {serif}",
-                    url = "",
+                    url,
                 };
             }).ToArray();
     }

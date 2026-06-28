@@ -89,6 +89,13 @@ public abstract class BaseListStory
                 if (sourceValue != null && cachePath != null)
                 {
                     var content = await Fetcher.Fetch(sourceValue);
+                    // Fetcher.Fetch returns the "{}" sentinel (not an exception) after exhausting
+                    // retries on HTTP/network failure. Caching it would write a 2-byte file that
+                    // Load() parses as 0 entries while Refresh() still reports success. Fail loudly
+                    // so the caller (engine download.refresh) learns the refresh actually failed.
+                    if (string.IsNullOrWhiteSpace(content) || content.Trim() == "{}")
+                        throw new InvalidOperationException(
+                            $"刷新失败：源 {key} 返回空数据（网络/源不可用，Fetcher 返回了 \"{{}}\" 兜底值）");
                     await File.WriteAllTextAsync(cachePath, content);
                 }
             }).ToArray();
