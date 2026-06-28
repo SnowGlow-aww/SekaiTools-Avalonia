@@ -19,7 +19,7 @@ settingsHandler.Register(dispatcher);
 dispatcher.Register("system.ping", _ => Task.FromResult<object?>(new { ok = true }));
 dispatcher.Register("system.version", _ => Task.FromResult<object?>(new
 {
-    name = "SekaiToolsEngine",
+    name = "SekaiCoreEngine",
     version = System.Reflection.Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "0.0.0",
     protocol = 1,
 }));

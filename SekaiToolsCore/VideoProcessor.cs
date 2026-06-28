@@ -43,7 +43,7 @@ public enum ProcessStopReason
     CaptureError // 捕获设备错误
 }
 
-public class VideoProcessor
+public class VideoProcessor : IDisposable
 {
     private bool _debugIgnoreBannerMarker;
     private volatile bool _isProcessing;
@@ -62,11 +62,13 @@ public class VideoProcessor
     public VideoProcessor(Config config, VideoProcessCallbacks callbacks)
     {
         Creator = new TemplateMatcherCreator(config);
-        Capture = new VideoCapture(config.VideoFilePath);
         DialogMatcher = Creator.DialogMatcher();
         ContentMatcher = Creator.ContentMatcher();
         BannerMatcher = Creator.BannerMatcher();
         MarkerMatcher = Creator.MarkerMatcher();
+        // Capture last: if a matcher/template build above throws, no VideoCapture
+        // handle has been opened yet, so a failed construction can't leak one.
+        Capture = new VideoCapture(config.VideoFilePath);
         Callbacks = callbacks;
     }
 
@@ -138,6 +140,19 @@ public class VideoProcessor
     public void StopProcess()
     {
         TokenSource?.Cancel();
+    }
+
+    // Releases this run's native handles (video capture + cancellation source).
+    // SubtitleHandler calls this before starting the next run so repeated 打轴 in
+    // one session doesn't pile up VideoCapture file handles. Idempotent: Process()
+    // already disposes+nulls Capture on a normal finish.
+    public void Dispose()
+    {
+        TokenSource?.Cancel();
+        TokenSource?.Dispose();
+        TokenSource = null;
+        Capture?.Dispose();
+        Capture = null;
     }
 
     private void Process(CancellationToken token)

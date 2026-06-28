@@ -216,6 +216,13 @@ public class SubtitleMaker(VideoInfo videoInfo, TemplateManager templateManager,
 
             if (set.UseSeparator)
             {
+                // 无头内核(SubtitleHandler)不像 Avalonia GUI 那样在卡片构造时调用 InitSeparator，
+                // SeparateFrame 会停留在 0；于是 SeparateDialogSet 里 sepCount = 0 - StartIndex() 为负，
+                // Frames[..sepCount] 取负长度抛 ArgumentOutOfRangeException，直接导致「无法导出 ass」。
+                // 导出前确保分隔帧是合法的中间帧；GUI 已设的合法值(落在区间内)不会被覆盖。
+                if (set.Separate.SeparateFrame <= set.StartIndex() ||
+                    set.Separate.SeparateFrame >= set.EndIndex())
+                    set.InitSeparator();
                 var items = SeparateDialogSet(set);
                 dialogEvents.Add(SubtitleEvent.Comment($"{dialogMarker}  Line 1 ↓",
                     set.StartTime(), set.EndTime(), "Screen"));

@@ -2,6 +2,7 @@ using System.Text.Json;
 using Emgu.CV;
 using Emgu.CV.CvEnum;
 using SekaiToolsCore;
+using SekaiToolsCore.Match.TemplateMatcher;
 using SekaiToolsCore.Process.Config;
 using SekaiToolsCore.Process.FrameSet;
 using SekaiToolsEngine.Ipc;
@@ -71,9 +72,12 @@ public sealed class SubtitleHandler
         lock (_lock)
         {
             _processor?.StopProcess();
+            _processor?.Dispose(); // 释放上一段视频的 VideoCapture/Token，避免连打多个视频时句柄堆积
             _dialogs.Clear();
             _banners.Clear();
             _markers.Clear();
+            // 清掉跨运行的静态匹配缓存，杜绝上一段视频的缓存残留影响本次匹配。
+            TemplateMatchCachePool.ResetAll();
             try
             {
                 _processor = new VideoProcessor(config, callbacks);

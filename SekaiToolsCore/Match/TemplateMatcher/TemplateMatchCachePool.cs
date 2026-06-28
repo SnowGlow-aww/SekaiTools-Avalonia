@@ -49,6 +49,14 @@ public class TemplateMatchCachePool
         return GlobalPool[(int)usage];
     }
 
+    // Drop the process-wide pool so a new run starts with no carried-over prevImg/
+    // prevResult from the previous video. The old pool instances become unrooted and
+    // are reclaimed by GC; the next GetPool rebuilds a fresh set. Called at每次开新打轴.
+    public static void ResetAll()
+    {
+        _globalPool = null;
+    }
+
     public static void NextDialog()
     {
         GlobalPool[(int)MatchUsage.DialogNameTag].Reset();

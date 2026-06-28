@@ -6,6 +6,10 @@
         <ImplicitUsings>enable</ImplicitUsings>
         <Nullable>enable</Nullable>
         <RootNamespace>SekaiToolsEngine</RootNamespace>
+        <!-- Output binary name shown to users (system.version reports the same).
+             The project dir/csproj/namespace stay SekaiToolsEngine to avoid churn;
+             only the emitted apphost is renamed. -->
+        <AssemblyName>SekaiCoreEngine</AssemblyName>
         <RuntimeIdentifiers>osx-arm64;win-x64</RuntimeIdentifiers>
         <PublishSingleFile>true</PublishSingleFile>
         <SelfContained>true</SelfContained>
