@@ -6,9 +6,9 @@ public class Config
         string videoFilePath,
         string scriptFilePath,
         string translateFilePath,
-        StyleFontConfig styleFontConfig = default,
-        ExportStyleConfig exportStyleConfig = default,
-        TypewriterSetting typerSetting = default,
+        StyleFontConfig? styleFontConfig = null,
+        ExportStyleConfig? exportStyleConfig = null,
+        TypewriterSetting? typerSetting = null,
         MatchingThreshold? matchingThreshold = null
     )
     {
@@ -23,10 +23,15 @@ public class Config
         ScriptFilePath = scriptFilePath;
         TranslateFilePath = translateFilePath;
 
-        StyleFontConfig = styleFontConfig;
-        ExportStyleConfig = exportStyleConfig;
+        // Construct real defaults when a caller omits these. `default(struct)` zero-inits
+        // and SKIPS the `= true`/value init defaults, so a `= default` param silently gave an
+        // all-FALSE ExportStyleConfig (every subtitle line filtered out by Make() -> empty .ass),
+        // empty font families, and zero typewriter timings. The IPC engine (SubtitleHandler)
+        // omits all three — that is exactly what produced the styled-but-event-less .ass.
+        StyleFontConfig = styleFontConfig ?? new StyleFontConfig();
+        ExportStyleConfig = exportStyleConfig ?? new ExportStyleConfig();
 
-        TyperSetting = typerSetting;
+        TyperSetting = typerSetting ?? new TypewriterSetting();
         MatchingThreshold = matchingThreshold ?? new MatchingThreshold();
     }
 
