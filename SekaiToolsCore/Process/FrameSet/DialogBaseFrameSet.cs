@@ -19,9 +19,16 @@ public struct Separator
 
 public partial class DialogBaseFrameSet : BaseFrameSet
 {
-    private const int FrameIndexOffset = -1;
+    // 单位换算锚点：Frames[].Index = 传入的原始 frameIndex + FrameIndexOffset(1-based PosFrames → 0-based 真帧号)。
+    // 起笔回溯需在 DialogTemplateMatcher 里做同一换算，故设为 public 供其复用同一常量。
+    public const int FrameIndexOffset = -1;
 
     public Separator Separate;
+
+    // 逐帧匹配进度记录(0-based, 与 Frames[].Index 同单位)：首次达到 3字/6字 指纹的帧号，
+    // 供分隔帧按实测打字速度估算(打字机打到某加权字长所用的帧数基线)。未达到时保持 -1。
+    public int FirstProgress2Frame { get; set; } = -1; // 首次达到 Matched2(3字指纹) 的帧
+    public int FirstProgress3Frame { get; set; } = -1; // 首次达到 Matched3(6字指纹) 的帧
 
     public DialogBaseFrameSet(DialogStoryEvent data, FrameRate fps)
     {

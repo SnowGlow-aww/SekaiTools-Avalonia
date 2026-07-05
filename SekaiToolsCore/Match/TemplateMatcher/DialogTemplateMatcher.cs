@@ -56,7 +56,100 @@ public class DialogTemplateMatcher(
     private int DroppedGraceFrames =>
         (int)Math.Ceiling(videoInfo.Fps.Fps() * Math.Max(0, config.MatchingThreshold.DialogDropGraceSeconds));
 
+    // 起笔回溯(onset backdate)：消除"下一条对话真实起点已到、但要等宽限耗尽/6字指纹打全才被记录"
+    // 造成的系统性轴前滞后。逐帧用"名牌 + 内容首字(降阈)"探测某条对话最早出现的帧，真实命中时把该条
+    // 的起点回填到这个最早帧。所有 onset 帧都是原始 frameIndex 单位(未做 FrameIndexOffset)。
+    private int _onsetDialogIndex = -1; // 起笔候选属于哪条对话
+    private int _onsetFrame = -1; // 原始 frameIndex 单位(与 Process 参数一致, 未做 FrameIndexOffset)
+    private Point _onsetPoint = Point.Empty; // 起笔时名牌位置
+    private bool _onsetDuringHold; // 是否在 Matched1/2 hold(anti-lag)期间录得(此期间当前条命中可疑, 不因其继续命中而作废)
+    private bool _charOneOnsetHit; // DialogMatchContent 的 DialogNotMatched 分支写：首字模板分数是否过了 onset 降阈
+    private static bool OnsetBackdateDisabled =>
+        Environment.GetEnvironmentVariable("DisableOnsetBackdate") == "true"; // A/B 与线上兜底开关
+    private int OnsetMaxBackdateFrames => (int)Math.Ceiling(videoInfo.Fps.Fps() * 0.35);
+    private const double OnsetThresholdDelta = 0.15;
+    private const double OnsetMinThreshold = 0.50;
+
     public bool Finished => Set.All(d => d.Finished) || Set.Count == 0;
+
+    private void ResetOnset()
+    {
+        _onsetDialogIndex = -1;
+        _onsetFrame = -1;
+        _onsetPoint = Point.Empty;
+        _onsetDuringHold = false;
+    }
+
+    // 记录起笔候选：仅当候选还不属于该条时才写(保持最早记录不被后续帧覆盖)。
+    private void RecordOnset(int dialogIdx, int frameIndex, Point point, bool duringHold)
+    {
+        if (_onsetDialogIndex == dialogIdx) return;
+        _onsetDialogIndex = dialogIdx;
+        _onsetFrame = frameIndex;
+        _onsetPoint = point;
+        _onsetDuringHold = duringHold;
+    }
+
+    /// <summary>
+    /// 起笔探测：用"名牌(正常阈值,无 fallback) + 内容首字(降阈)"判断某条对话此刻是否已经开始出现在画面里，
+    /// 命中则记录其最早帧供真实命中时回溯起点。与 ProbeDialog(需 6 字指纹)不同——这里只要首字微微出现即算数，
+    /// 目的正是抓到"打字机刚落笔"的那一刻。命中/失配都按连续性维护候选(见下)。
+    /// </summary>
+    private void TryProbeOnset(Mat img, int dialogIdx, int frameIndex, bool duringHold)
+    {
+        var dialogBase = Set[dialogIdx];
+        var body = dialogBase.Data.BodyOriginal;
+        if (string.IsNullOrEmpty(body))
+        {
+            // 正文为空 → 无法用内容首字确认，视为未命中；若陈旧候选属于本条则按失配清掉。
+            if (_onsetDialogIndex == dialogIdx) ResetOnset();
+            return;
+        }
+
+        var hit = false;
+        var point = Point.Empty;
+
+        // 1) 名牌(正常阈值, 不用 fallback，同 ProbeDialog 第一步)
+        var nameTpl = GetNameTag(TrimTemplateContent(dialogBase.Data.CharacterOriginal));
+        var nameThr = dialogBase.Data.Shake
+            ? config.MatchingThreshold.DialogNametagSpecial
+            : config.MatchingThreshold.DialogNametagNormal;
+        var nameRoi = NameTagCropArea(nameTpl.Size, dialogBase.Data.Shake);
+        if (!(nameRoi.IsEmpty || nameRoi.Width < nameTpl.Size.Width || nameRoi.Height < nameTpl.Size.Height))
+        {
+            using var nameCrop = new Mat(img, nameRoi);
+            var nameRes = TemplateMatcher.Match(nameCrop, nameTpl, TemplateMatchCachePool.MatchUsage.Misc);
+            if (nameRes.MaxVal > nameThr && nameRes.MaxVal < 1)
+            {
+                point = new Point(nameRes.MaxLoc.X + nameRoi.X, nameRes.MaxLoc.Y + nameRoi.Y);
+
+                // 2) 内容首字(前 1 字)——降阈 max(内容阈值-Δ, 下限)，抓打字机刚落笔的首帧。ROI 同 ProbeDialog 第二步。
+                var contentTpl = new GaMat(templateManager.GetTemplate(TemplateUsage.DialogContent, body[..1]));
+                var contentThr = Math.Max(
+                    (dialogBase.Data.Shake
+                        ? config.MatchingThreshold.DialogContentSpecial
+                        : config.MatchingThreshold.DialogContentNormal) - OnsetThresholdDelta,
+                    OnsetMinThreshold);
+                var offset = TemplateManager.GetFontSize(img.Size);
+                var crect = new Rectangle(point.X + (int)(0.1 * offset), point.Y + (int)(1.1 * offset),
+                    (int)(7.5 * offset), (int)(2.0 * offset));
+                if (dialogBase.Data.Shake) crect.Extend(0.6);
+                crect.Limit(new Rectangle(Point.Empty, videoInfo.Resolution));
+                if (!(crect.IsEmpty || crect.Width < contentTpl.Size.Width || crect.Height < contentTpl.Size.Height))
+                {
+                    using var contentCrop = new Mat(img, crect);
+                    var contentRes = TemplateMatcher.Match(contentCrop, contentTpl,
+                        TemplateMatchCachePool.MatchUsage.Misc);
+                    hit = contentRes.MaxVal > contentThr && contentRes.MaxVal < 1;
+                }
+            }
+        }
+
+        if (hit)
+            RecordOnset(dialogIdx, frameIndex, point, duringHold);
+        else if (_onsetDialogIndex == dialogIdx)
+            ResetOnset(); // 连续性要求：本条一旦失配就清掉陈旧候选，防止用过时的帧回溯
+    }
 
     private GaMat GetNameTag(string name)
     {
@@ -197,6 +290,9 @@ public class DialogTemplateMatcher(
         int frameIndex = -1)
     {
         var content = dialogBase.Data.BodyOriginal;
+        // 每次进入都先清 onset 首字命中标志：只有下面 DialogNotMatched 分支真正跑了首字匹配才会把它置真，
+        // 避免 NameTagNotMatched/Dropped→DialogNotMatched 这类"没跑内容匹配就返回 DialogNotMatched"的路径读到陈旧值。
+        _charOneOnsetHit = false;
         if (point.X == 0) return 0;
         var charTemplates = GetDialogInd();
         var template1 = charTemplates[0];
@@ -213,32 +309,36 @@ public class DialogTemplateMatcher(
         {
             case MatchStatus.DialogNotMatched:
             {
+                // 主动未匹配阶段(名牌已在、内容还没到正常阈值)：把首字模板的原始分数拿出来，
+                // 过 onset 降阈即视作"起笔已现"，供 Process 记录回溯候选(此时正常阈值还没命中，不算真起点)。
                 matchRes = LocalMatch(img, template1, matchingThreshold,
-                    TemplateMatchCachePool.MatchUsage.DialogContent1);
+                    TemplateMatchCachePool.MatchUsage.DialogContent1, out var scoreOne);
+                var onsetThr = Math.Max(matchingThreshold - OnsetThresholdDelta, OnsetMinThreshold);
+                _charOneOnsetHit = scoreOne > onsetThr && scoreOne < 1;
                 return matchRes ? MatchStatus.DialogMatched1 : MatchStatus.DialogNotMatched;
             }
             case MatchStatus.DialogMatched1:
             {
                 matchRes = LocalMatch(img, template2, matchingThreshold,
-                    TemplateMatchCachePool.MatchUsage.DialogContent2);
+                    TemplateMatchCachePool.MatchUsage.DialogContent2, out _);
                 if (matchRes) return MatchStatus.DialogMatched2;
                 matchRes = LocalMatch(img, template1, matchingThreshold,
-                    TemplateMatchCachePool.MatchUsage.DialogContent1);
+                    TemplateMatchCachePool.MatchUsage.DialogContent1, out _);
                 return matchRes ? MatchStatus.DialogMatched1 : MatchStatus.DialogDropped;
             }
             case MatchStatus.DialogMatched2:
             {
                 matchRes = LocalMatch(img, template3, matchingThreshold,
-                    TemplateMatchCachePool.MatchUsage.DialogContent3);
+                    TemplateMatchCachePool.MatchUsage.DialogContent3, out _);
                 if (matchRes) return MatchStatus.DialogMatched3;
                 matchRes = LocalMatch(img, template2, matchingThreshold,
-                    TemplateMatchCachePool.MatchUsage.DialogContent2);
+                    TemplateMatchCachePool.MatchUsage.DialogContent2, out _);
                 return matchRes ? MatchStatus.DialogMatched2 : MatchStatus.DialogDropped;
             }
             case MatchStatus.DialogMatched3:
             {
                 matchRes = LocalMatch(img, template3, matchingThreshold,
-                    TemplateMatchCachePool.MatchUsage.DialogContent3);
+                    TemplateMatchCachePool.MatchUsage.DialogContent3, out _);
                 return matchRes ? MatchStatus.DialogMatched3 : MatchStatus.DialogDropped;
             }
             case MatchStatus.NameTagNotMatched:
@@ -248,8 +348,10 @@ public class DialogTemplateMatcher(
         }
 
 
-        bool LocalMatch(Mat src, GaMat tmp, double threshold, TemplateMatchCachePool.MatchUsage usage)
+        bool LocalMatch(Mat src, GaMat tmp, double threshold, TemplateMatchCachePool.MatchUsage usage,
+            out double score)
         {
+            score = 0;
             var offset = TemplateManager.GetFontSize(src.Size);
             Rectangle dialogStartPosition = new(
                 point.X + (int)(0.1 * offset),
@@ -268,6 +370,7 @@ public class DialogTemplateMatcher(
 
             var imgCropped = new Mat(src, dialogStartPosition);
             var result = TemplateMatcher.Match(imgCropped, tmp, usage);
+            score = result.MaxVal;
 
             if (frameIndex != -1)
                 Logger.Log(
@@ -360,6 +463,9 @@ public class DialogTemplateMatcher(
                 _emptyStuckFrames = 0;
                 _lookaheadHits = 0;
                 _lookaheadTarget = -1;
+                // 起笔候选若落后于新的活动对话(属于已翻篇的更早条)则清掉；等于当前活动对话的要留着——
+                // 那正是宽限期间为"下一条"录下、此刻要转交给它去回溯起点的候选。
+                if (_onsetDialogIndex >= 0 && _onsetDialogIndex < dIndex) ResetOnset();
             }
 
             var dialogRefers = Set[dIndex];
@@ -388,6 +494,9 @@ public class DialogTemplateMatcher(
                         var nextAppeared = probeIdx < Set.Count && ProbeDialog(frame, Set[probeIdx]);
                         if (!nextAppeared)
                         {
+                            // 下一条 6 字指纹还没打全(所以 nextAppeared 假)，但它的首字可能已经落笔——
+                            // 每帧探一下起笔，记下最早出现帧，稍后下一条真正命中时把起点回溯到这里(消滞后)。
+                            if (probeIdx < Set.Count) TryProbeOnset(frame, probeIdx, frameIndex, false);
                             _droppedGrace++;
                             _pendingFrames.Add((frameIndex, Set[dIndex].End().Point));
                             _useFallbackThreshold = true;
@@ -411,6 +520,19 @@ public class DialogTemplateMatcher(
                 case MatchStatus.DialogNotMatched or MatchStatus.NameTagNotMatched:
                     _consecutiveFailures++;
                     _emptyStuckFrames++;
+
+                    // 起笔回溯：主动扫描阶段的候选维护。DialogNotMatched=名牌已在、首字尚未到正常阈值：
+                    // 若首字过了 onset 降阈(_charOneOnsetHit)就记下起笔候选，否则本条的陈旧候选按连续性清掉。
+                    // NameTagNotMatched=名牌都不在，本条不可能在起笔，属于本条的陈旧候选一律清掉。
+                    if (_status == MatchStatus.DialogNotMatched)
+                    {
+                        if (_charOneOnsetHit) RecordOnset(dIndex, frameIndex, matchResult.Point, false);
+                        else if (_onsetDialogIndex == dIndex) ResetOnset();
+                    }
+                    else if (_onsetDialogIndex == dIndex)
+                    {
+                        ResetOnset();
+                    }
 
                     // 卡住跳过(look-ahead)：仅当"当前这条的名牌此刻根本不在画面里(NameTagNotMatched)"、
                     // 且从没匹配上(IsEmpty)、且已卡够久时，才探测"下一条"是否已经出现；连续确认
@@ -446,6 +568,8 @@ public class DialogTemplateMatcher(
                                     $"{nameof(DialogTemplateMatcher)} Frame {frameIndex} skip stuck dialogs idx={dIndex}..{found - 1} (idx={found} appeared)");
                                 // 跳过 dIndex..found-1：都标记完成、留空集(下游忽略)
                                 for (var s = dIndex; s < found; s++) Set[s].Finished = true;
+                                // 起笔候选若落后于新的活动对话 found(属于被跳掉的那些条)则清掉；等于 found 的保留。
+                                if (_onsetDialogIndex >= 0 && _onsetDialogIndex < found) ResetOnset();
                                 _emptyStuckFrames = 0;
                                 _consecutiveFailures = 0;
                                 _useFallbackThreshold = false;
@@ -483,6 +607,9 @@ public class DialogTemplateMatcher(
                     {
                         var nextI = dIndex + 1;
                         while (nextI < Set.Count && Set[nextI].Finished) nextI++;
+                        // 当前行卡在短前缀 hold 期间(其命中本身可疑)，每帧探下一条起笔并标记 duringHold——
+                        // 这类候选不因"当前行继续命中"作废，由 0.35s 上限兜底，专治此路径下下一条起点晚约 6 字打字时长。
+                        if (nextI < Set.Count) TryProbeOnset(frame, nextI, frameIndex, true);
                         if (nextI < Set.Count && ProbeDialog(frame, Set[nextI]))
                         {
                             if (_pendingFrames.Count > 0)
@@ -503,6 +630,29 @@ public class DialogTemplateMatcher(
                         }
                     }
 
+                    // 起笔回溯消费：仅在本条**第一帧**真实命中时(IsEmpty)把起点回填到最早探到起笔的帧，
+                    // 抹平"下一条起点等宽限耗尽/指纹打全才被记录"的系统性轴前滞后。
+                    if (Set[dIndex].IsEmpty() && !OnsetBackdateDisabled &&
+                        _onsetDialogIndex == dIndex && _onsetFrame < frameIndex)
+                    {
+                        var from = Math.Max(_onsetFrame, frameIndex - OnsetMaxBackdateFrames);
+                        // 不早于"上一条非空已定版对话最后真实帧的下一帧"，防导出事件重叠。
+                        // 单位换算：Frames[].Index = 原始 frameIndex + FrameIndexOffset，故上一条最后真实帧的
+                        // 原始帧号 = End().Index - FrameIndexOffset，回溯起点取其 +1。
+                        for (var j = dIndex - 1; j >= 0; j--)
+                        {
+                            if (!Set[j].Finished || Set[j].IsEmpty()) continue;
+                            from = Math.Max(from, Set[j].End().Index - DialogBaseFrameSet.FrameIndexOffset + 1);
+                            break;
+                        }
+
+                        // 回填 [from, frameIndex) 的每一帧，保持 Frames 密集(SeparateDialogSet 按帧数切片依赖密集性)。
+                        for (var f = from; f < frameIndex; f++) Set[dIndex].Add(f, matchResult.Point);
+                        if (from < frameIndex)
+                            Logger.Log(
+                                $"{nameof(DialogTemplateMatcher)} Frame {frameIndex} onset backdate idx={dIndex} frames={frameIndex - from}");
+                    }
+
                     // Real match (possibly a recovery after a dropped streak): commit
                     // any frames buffered during the grace window first, so the dialog
                     // spans the transient gap, then add this frame.
@@ -513,6 +663,11 @@ public class DialogTemplateMatcher(
                     }
 
                     Set[dIndex].Add(frameIndex, matchResult.Point);
+                    // 记录匹配进度(0-based, 取刚加入帧的 Index=frameIndex+FrameIndexOffset)：首次达到 3/6 字指纹的帧，供分隔帧估算。
+                    if (_status == MatchStatus.DialogMatched2 && Set[dIndex].FirstProgress2Frame < 0)
+                        Set[dIndex].FirstProgress2Frame = Set[dIndex].End().Index;
+                    else if (_status == MatchStatus.DialogMatched3 && Set[dIndex].FirstProgress3Frame < 0)
+                        Set[dIndex].FirstProgress3Frame = Set[dIndex].End().Index;
                     _lastMatchedStatus = _status;
                     _droppedGrace = 0;
                     _consecutiveFailures = 0;
@@ -520,6 +675,9 @@ public class DialogTemplateMatcher(
                     _emptyStuckFrames = 0;
                     _lookaheadHits = 0;
                     _lookaheadTarget = -1;
+                    // 起笔候选作废：本条真实命中已消费/取代它的候选则清；否则(候选属别的条)只有非 hold 期录的才清——
+                    // 宽限恢复证明画面还是本条的，那种候选无效；hold 期录的候选本就可疑但要留给下一条，由 0.35s 上限兜底。
+                    if (_onsetDialogIndex == dIndex || !_onsetDuringHold) ResetOnset();
                     return IsStatusMatched(firstStatus.Value);
             }
         }

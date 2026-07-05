@@ -1,5 +1,6 @@
 using System.Drawing;
 using System.Text;
+using SekaiToolsBase;
 using SekaiToolsBase.Story.StoryEvent;
 using SekaiToolsBase.SubStationAlpha;
 using SekaiToolsBase.SubStationAlpha.AssDraw;
@@ -222,7 +223,7 @@ public class SubtitleMaker(VideoInfo videoInfo, TemplateManager templateManager,
                 // 导出前确保分隔帧是合法的中间帧；GUI 已设的合法值(落在区间内)不会被覆盖。
                 if (set.Separate.SeparateFrame <= set.StartIndex() ||
                     set.Separate.SeparateFrame >= set.EndIndex())
-                    set.InitSeparator();
+                    EstimateSeparator(set);
                 var items = SeparateDialogSet(set);
                 dialogEvents.Add(SubtitleEvent.Comment($"{dialogMarker}  Line 1 ↓",
                     set.StartTime(), set.EndTime(), "Screen"));
@@ -362,6 +363,126 @@ public class SubtitleMaker(VideoInfo videoInfo, TemplateManager templateManager,
             returnVal.AddRange(characterEvents);
             return returnVal;
         }
+    }
+
+    // 分隔帧估算：三行长台词的 Line1→Line2 切换时刻，应≈游戏打字机打到"译文分割点对应的原文位置"的时刻，
+    // 而非旧的 InitSeparator 用的"显示时长中点"(配音长的行会让切换严重偏晚)。用逐帧记录的打字进度基线换算。
+    private void EstimateSeparator(DialogBaseFrameSet set)
+    {
+        // A/B 与线上兜底：显式关闭时回退旧的"显示时长中点"分隔。
+        if (Environment.GetEnvironmentVariable("DisableSeparatorEstimate") == "true")
+        {
+            set.InitSeparator();
+            return;
+        }
+
+        // 加权字长：ASCII(半角)记 0.5、其余记 1，忽略换行——打字机对半角是半速；口径与状态机的指纹加权一致。
+        static double Weight(string s)
+        {
+            var w = 0d;
+            foreach (var c in s)
+            {
+                if (c is '\n' or '\r') continue;
+                w += char.IsAscii(c) ? 0.5 : 1;
+            }
+
+            return w;
+        }
+
+        var translated = set.Data.FinalContent.TrimAll(); // 译文口径与 SeparateDialogSet 一致
+        var original = set.Data.BodyOriginal;
+        var sepIdx = set.Separate.SeparatorContentIndex;
+
+        var wTransAll = Weight(translated);
+        if (sepIdx <= 0 || sepIdx >= translated.Length || wTransAll <= 0)
+        {
+            set.InitSeparator();
+            return;
+        }
+
+        var ratio = Weight(translated[..sepIdx]) / wTransAll;
+        if (ratio is <= 0 or >= 1)
+        {
+            set.InitSeparator();
+            return;
+        }
+
+        var wOrigAll = Weight(original);
+        if (wOrigAll <= 0)
+        {
+            set.InitSeparator();
+            return;
+        }
+
+        var fps = videoInfo.Fps.Fps();
+        var startIndex = set.StartIndex();
+        var wt = ratio * wOrigAll; // 目标：分隔点对应的原文加权位置
+        var w1 = original.Length > 0 ? Weight(original[..1]) : 0; // 首字加权长(起点锚对应的加权位置)
+
+        // 打字机跨过换行时停顿 300ms。统计原文加权位置区间 [wFrom, wTo) 内的换行停顿数(用于斜率区间扣除
+        // 与锚点→分隔点的补偿)，避免同一停顿既被实测区间吃进斜率、又被显式加回而重复计入。
+        double PausesBetween(double wFrom, double wTo)
+        {
+            if (wTo < wFrom) return -PausesBetween(wTo, wFrom);
+            var count = 0;
+            var walked = 0d;
+            foreach (var c in original)
+            {
+                if (walked >= wTo) break;
+                if (c == '\n')
+                {
+                    if (walked >= wFrom) count++;
+                    continue;
+                }
+
+                if (c == '\r') continue;
+                walked += char.IsAscii(c) ? 0.5 : 1;
+            }
+
+            return count;
+        }
+
+        // 打字速度先验(帧/加权单位)：CharTime 与游戏打字速度同源；CharTime 被关(≤0)时用游戏典型值 80ms。
+        var ctMs = TypewriterSetting.CharTime > 0 ? TypewriterSetting.CharTime : 80;
+        var ctSlope = ctMs / 1000.0 * fps;
+
+        // 实测斜率只能用 P2→P3 两点(同为真实命中帧)：StartIndex 可能被起笔回溯改早、与 P2/P3 不同源，
+        // 用它当锚会把斜率放大 backdate 帧数。另一头，起点检测偏晚(如快速连续对话)时状态机每帧只升一级
+        // "追赶"，P3-P2 会缩成 1-2 帧、算出远小于真实的假斜率——所以实测值必须过先验合理性门控
+        // (0.4x~2.5x CharTime)，不可信则回退先验；先验锚定在(回溯后≈真实打字起点的)StartIndex 上。
+        var slope = ctSlope;
+        var baseline = "CharTime";
+        var anchorFrame = (double)startIndex;
+        var anchorW = w1;
+        if (set.FirstProgress2Frame >= 0 && set.FirstProgress3Frame > set.FirstProgress2Frame)
+        {
+            var w2 = Weight(original[..Math.Min(3, original.Length)]);
+            var w3 = Weight(original[..Math.Min(6, original.Length)]);
+            var span = w3 - w2;
+            if (span >= 0.5)
+            {
+                var raw = (set.FirstProgress3Frame - set.FirstProgress2Frame - PausesBetween(w2, w3) * 0.3 * fps) /
+                          span;
+                if (raw >= 0.4 * ctSlope && raw <= 2.5 * ctSlope)
+                {
+                    slope = raw;
+                    baseline = "P2P3";
+                    anchorFrame = set.FirstProgress3Frame;
+                    anchorW = w3;
+                }
+            }
+        }
+
+        var est = anchorFrame + (wt - anchorW) * slope + PausesBetween(anchorW, wt) * 0.3 * fps;
+        var sepFrame = UtilFunc.Middle(startIndex + 1, (int)Math.Round(est), set.EndIndex() - 1);
+
+        // 与旧的"显示时长中点"对照，便于 A/B 观察。
+        var oldMid = UtilFunc.Middle(startIndex + 1, set.EndIndex() - 1, startIndex + set.Frames.Count / 2);
+        Logger.Log(
+            $"{nameof(SubtitleMaker)} EstimateSeparator start={startIndex} est={sepFrame} (raw={est:F1}) oldMid={oldMid} " +
+            $"ratio={ratio:F3} baseline={baseline}");
+
+        set.SetSeparator(sepFrame, sepIdx);
     }
 
     #endregion
