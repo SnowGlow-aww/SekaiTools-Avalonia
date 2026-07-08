@@ -20,7 +20,8 @@ dispatcher.Register("system.ping", _ => Task.FromResult<object?>(new { ok = true
 dispatcher.Register("system.version", _ => Task.FromResult<object?>(new
 {
     name = "SekaiCoreEngine",
-    version = System.Reflection.Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "0.0.0",
+    // ToString(3)：对外展示三位语义化版本（1.1.0），AssemblyVersion 固有的第四位(Revision)不外露
+    version = System.Reflection.Assembly.GetExecutingAssembly().GetName().Version?.ToString(3) ?? "0.0.0",
     protocol = 1,
 }));
 

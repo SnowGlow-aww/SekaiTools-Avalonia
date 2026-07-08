@@ -10,7 +10,7 @@
              The project dir/csproj/namespace stay SekaiToolsEngine to avoid churn;
              only the emitted apphost is renamed. -->
         <AssemblyName>SekaiCoreEngine</AssemblyName>
-        <Version>1.0.1</Version>
+        <Version>1.1.0</Version>
         <RuntimeIdentifiers>osx-arm64;win-x64</RuntimeIdentifiers>
         <PublishSingleFile>true</PublishSingleFile>
         <SelfContained>true</SelfContained>
@@ -21,6 +21,14 @@
         <ProjectReference Include="..\SekaiToolsBase\SekaiToolsBase.csproj" />
         <ProjectReference Include="..\SekaiDataFetch\SekaiDataFetch.csproj" />
         <ProjectReference Include="..\SekaiToolsPlatform\SekaiToolsPlatform.csproj" />
+    </ItemGroup>
+
+    <ItemGroup>
+        <!-- 字幕默认字体（思源黑体 CN Bold / SC Medium）随引擎发布：
+             压制时通过 subtitles 滤镜的 fontsdir 交给 libass，保证没装字体的机器
+             也能压出正确字形（否则 macOS 会静默回退苹方，字幕整体变窄）。 -->
+        <Content Include="..\resource\fonts\**" Link="fonts\%(Filename)%(Extension)"
+                 CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
     </ItemGroup>
 
     <ItemGroup>

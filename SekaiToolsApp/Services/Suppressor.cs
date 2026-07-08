@@ -537,7 +537,37 @@ public sealed partial class Suppressor : IDisposable
             return null;
 
         var escaped = EscapeFfmpegFilterValue(Path.GetFullPath(_options.SourceSubtitle));
-        return $"subtitles=filename={escaped}";
+        var filter = $"subtitles=filename={escaped}";
+
+        // 字幕样式默认引用思源黑体（"思源黑体 CN Bold"/"思源黑体 Medium"），但用户机器上
+        // 往往没装（macOS 不自带）：libass 找不到家族名会静默回退系统兜底字体（macOS 上
+        // 是苹方 Regular），成品字幕整体变窄变细且丢失字重，还没有任何报错。
+        // 因此把字体随引擎一起发布（可执行文件旁的 fonts/），压制时交给 libass 检索；
+        // 系统已装同名字体时结果不变。目录不存在（如自定义部署）则保持旧行为。
+        var fontsDir = BundledFontsDir();
+        if (fontsDir is not null)
+            filter += $":fontsdir={EscapeFfmpegFilterValue(fontsDir)}";
+
+        return filter;
+    }
+
+    /// <summary>随应用/引擎发布的字幕字体目录（存在且非空才返回）。</summary>
+    private static string? BundledFontsDir()
+    {
+        var baseDir = Path.GetDirectoryName(Environment.ProcessPath);
+        if (string.IsNullOrEmpty(baseDir)) baseDir = AppContext.BaseDirectory;
+        var dir = Path.Combine(baseDir, "fonts");
+        try
+        {
+            if (Directory.Exists(dir) && Directory.EnumerateFiles(dir).Any())
+                return dir;
+        }
+        catch
+        {
+            // 探测失败不影响压制，退回不带 fontsdir 的旧行为。
+        }
+
+        return null;
     }
 
     /// <summary>

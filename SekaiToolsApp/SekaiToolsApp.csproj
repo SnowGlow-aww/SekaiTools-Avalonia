@@ -30,6 +30,9 @@
     <ItemGroup>
         <AvaloniaResource Include="Assets\**" />
         <Content Include="Resources\lim5994.vpy" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+        <!-- 字幕默认字体随应用发布，供压制 fontsdir 使用（说明见 SekaiToolsEngine.csproj） -->
+        <Content Include="..\resource\fonts\**" Link="fonts\%(Filename)%(Extension)"
+                 CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
     </ItemGroup>
 
     <ItemGroup>
