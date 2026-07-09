@@ -16,7 +16,7 @@ public class TemplateMatcherCreator
     }
 
     private Config Config { get; }
-    private VideoInfo VInfo { get; }
+    public VideoInfo VInfo { get; }
     public SekaiStory Story { get; }
     private TemplateManager Manager { get; }
 

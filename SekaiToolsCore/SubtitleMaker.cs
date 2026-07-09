@@ -367,7 +367,8 @@ public class SubtitleMaker(VideoInfo videoInfo, TemplateManager templateManager,
 
     // 分隔帧估算：三行长台词的 Line1→Line2 切换时刻，应≈游戏打字机打到"译文分割点对应的原文位置"的时刻，
     // 而非旧的 InitSeparator 用的"显示时长中点"(配音长的行会让切换严重偏晚)。用逐帧记录的打字进度基线换算。
-    private void EstimateSeparator(DialogBaseFrameSet set)
+    // public：无头引擎(subtitle.lines/estimateSeparator)需要在导出之外复用同一估算，保证 UI 默认值与导出一致。
+    public void EstimateSeparator(DialogBaseFrameSet set)
     {
         // A/B 与线上兜底：显式关闭时回退旧的"显示时长中点"分隔。
         if (Environment.GetEnvironmentVariable("DisableSeparatorEstimate") == "true")

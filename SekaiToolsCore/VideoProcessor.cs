@@ -8,6 +8,7 @@ using SekaiToolsBase.SubStationAlpha;
 using SekaiToolsCore.Match.TemplateMatcher;
 using SekaiToolsCore.Process.Config;
 using SekaiToolsCore.Process.FrameSet;
+using SekaiToolsCore.Process.Model;
 using SekaiToolsCore.Utils;
 
 namespace SekaiToolsCore;
@@ -103,6 +104,15 @@ public class VideoProcessor : IDisposable
         if (Creator == null) throw new NullReferenceException();
         var maker = Creator.SubtitleMaker();
         return maker.Make(dialogFrameSets, bannerFrameSets, markerFrameSets);
+    }
+
+    public VideoInfo VideoInfo => Creator?.VInfo ?? throw new NullReferenceException();
+
+    // 与导出走同一 SubtitleMaker.EstimateSeparator，让行列表里展示的默认分隔帧和最终导出一致。
+    public void EstimateSeparator(DialogBaseFrameSet set)
+    {
+        if (Creator == null) throw new NullReferenceException();
+        Creator.SubtitleMaker().EstimateSeparator(set);
     }
 
     public void StartProcess()
