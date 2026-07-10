@@ -9,6 +9,12 @@ public struct MatchingThreshold()
     public double DialogContentNormal { get; init; } = 0.80;
     public double DialogContentSpecial { get; init; } = 0.60;
     public double BannerNormal { get; init; } = 0.80;
+
+    // 横幅淡入/淡出边界的低阈值：横幅文字以 100~300ms 淡入（首条 300ms），匹配值
+    // 从噪声(~0.13-0.19)爬到 0.9+ 只需 2-4 帧；用低阈值把「刚开始显形/尚未消失」
+    // 的帧计入起止，修掉正常阈值造成的起始偏晚 4-8 帧 / 结束偏早 1-5 帧
+    // （用 event208 成品视频 + 人工校对基准逐帧标定）。
+    public double BannerFadeLow { get; init; } = 0.30;
     public double MarkerNormal { get; init; } = 0.80;
 
     // How long (seconds) to keep an already-matched dialog alive through transient

@@ -515,8 +515,22 @@ public class SubtitleMaker(VideoInfo videoInfo, TemplateManager templateManager,
             center.Y += (int)(offset * 2.5);
             center.Y = center.Y / 20 * 20;
             var content = set.Data.FinalContent;
-            var startTime = set.StartTime();
-            var endTime = set.EndTime();
+
+            // 起止精修（按 event208 成品 + 人工基准逐帧标定）：
+            //  - 文字行从淡入起笔再提前 ~33ms（低阈值边界仍滞后真实显形 1-2 帧）；
+            //  - 遮罩（灰条）比白字早现 ~50ms，遮罩行在文字行基础上再提前；
+            //  - 结束在淡出尾巴后再延 ~33ms（匹配值掉回噪声后画面仍有残影 2-3 帧）。
+            // 宁早勿晚：偏早只是中文横幅先现身，偏晚会露出原文——回溯失败时回退旧区间。
+            var fps = videoInfo.Fps.Fps();
+            var onset = set.OnsetFrame >= 0 ? set.OnsetFrame : set.StartIndex();
+            var tail = set.FadeTailFrame >= set.EndIndex() ? set.FadeTailFrame : set.EndIndex();
+            var textStartF = Math.Max(0, onset - (int)Math.Round(fps * 0.033));
+            var maskStartF = Math.Max(0, textStartF - (int)Math.Round(fps * 0.050));
+            var endF = tail + (int)Math.Round(fps * 0.033);
+
+            var startTime = new ProcessFrame(textStartF, videoInfo.Fps).StartTime();
+            var maskStartTime = new ProcessFrame(maskStartF, videoInfo.Fps).StartTime();
+            var endTime = new ProcessFrame(endF, videoInfo.Fps).EndTime();
 
             var maskFade = Tags.Fade(set.Data.TotalIndex == 0 ? 300 : 100, 200);
             var maskBlur = maskFade + Tags.Blur(30) + Tags.Anchor(7) + Tags.Paint(1);
@@ -550,9 +564,9 @@ public class SubtitleMaker(VideoInfo videoInfo, TemplateManager templateManager,
 
 
             var maskItem1 =
-                SubtitleEvent.Dialog(maskBlur + clipLeft + mask, startTime, endTime, "BannerMask");
+                SubtitleEvent.Dialog(maskBlur + clipLeft + mask, maskStartTime, endTime, "BannerMask");
             var maskItem2 =
-                SubtitleEvent.Dialog(maskBlur + clipRight + shift + mask, startTime, endTime, "BannerMask");
+                SubtitleEvent.Dialog(maskBlur + clipRight + shift + mask, maskStartTime, endTime, "BannerMask");
 
             return [maskItem1, maskItem2, contentItem];
         }

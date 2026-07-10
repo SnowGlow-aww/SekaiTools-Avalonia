@@ -11,6 +11,12 @@ public class BannerBaseFrameSet(BannerStoryEvent data, FrameRate fps) : BaseFram
 
     public bool Finished { get; set; }
 
+    // 淡入起笔 / 淡出收尾（低阈值边界，见 BannerTemplateMatcher）。-1 = 未标定，
+    // SubtitleMaker 回退到 [_start,_end]。匹配区间 [_start,_end] 保持正常阈值语义
+    // 不变（预览 UI 仍用它）。
+    public int OnsetFrame { get; set; } = -1;
+    public int FadeTailFrame { get; set; } = -1;
+
     public void Add(int index)
     {
         if (_start > index) _start = index;

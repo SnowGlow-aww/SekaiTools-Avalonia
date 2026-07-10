@@ -63,6 +63,7 @@ public sealed class SubtitleHandler
                 BannerNormal = th.TryGetProperty("bannerNormal", out var v5) ? v5.GetDouble() : 0.50,
                 MarkerNormal = th.TryGetProperty("markerNormal", out var v6) ? v6.GetDouble() : 0.50,
                 DialogDropGraceSeconds = th.TryGetProperty("dialogDropGraceSeconds", out var v7) ? v7.GetDouble() : 0.30,
+                BannerFadeLow = th.TryGetProperty("bannerFadeLow", out var v8) ? v8.GetDouble() : 0.30,
             };
         }
 
