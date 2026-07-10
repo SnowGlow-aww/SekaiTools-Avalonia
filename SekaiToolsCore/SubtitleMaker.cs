@@ -80,12 +80,12 @@ public class SubtitleMaker(VideoInfo videoInfo, TemplateManager templateManager,
 
     private static Queue<char> FormatDialogBodyArr(string body)
     {
+        // 换行一律保留：三行文本以前会被整体去换行，导致成品只剩一行长条、
+        // 后处理也无法按 \N 数命中「3行」样式（用户反馈）。
         var bodyCopy = body
             .Replace("…", "...")
             .Replace("... ...", "......")
             .Replace("\\N", "\n").Replace("\\n", "\n");
-        var lineCount = bodyCopy.Count(t => t == '\n');
-        if (lineCount == 2) bodyCopy = bodyCopy.Replace("\n", "");
         var queue = new Queue<char>();
         foreach (var c in bodyCopy) queue.Enqueue(c);
         return queue;
