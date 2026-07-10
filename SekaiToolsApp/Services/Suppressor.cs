@@ -28,6 +28,14 @@ public sealed class SuppressorOptions
     public bool UseHwAccelDecode { get; init; } = true;
 
     /// <summary>
+    /// 优先纯 ffmpeg 管线，本机残留的 VapourSynth 只作兜底（无 ffmpeg 时）。
+    /// SekaiText IPC 引擎必须开：老 SekaiTools 在用户目录装过 VapourSynth 的机器上，
+    /// 自动探测会把压制切到我们控制不了的 VSPipe，坏掉时只报
+    /// "yuv4mpegpipe … Header too large."，且 VSFilter 烧字幕拿不到随引擎发布的字体。
+    /// </summary>
+    public bool PreferFfmpegPipeline { get; init; }
+
+    /// <summary>
     /// 视频总帧数，用于进度百分比计算。零值时由 <see cref="Suppressor"/> 自行 probe，
     /// 再缓存到该字段（仅本次启动有效）。
     /// </summary>
@@ -81,6 +89,7 @@ public sealed partial class Suppressor : IDisposable
     private Process? _fProcess;
     private Task? _pipeTask;
     private Task? _logTask;
+    private Task? _vLogTask;
     private CancellationTokenSource? _cts;
     private int _frameCount;
     private double _fps;
@@ -94,8 +103,8 @@ public sealed partial class Suppressor : IDisposable
         _x264Params = new X264Params { Crf = options.Crf };
     }
 
-    public static SuppressRuntimeProbe ProbeRuntime(string? ffmpegPathHint = null)
-        => SuppressRuntimeService.Probe(ffmpegPathHint);
+    public static SuppressRuntimeProbe ProbeRuntime(string? ffmpegPathHint = null, bool preferFfmpeg = false)
+        => SuppressRuntimeService.Probe(ffmpegPathHint, preferFfmpeg);
 
     public bool IsRunning => _vProcess is { HasExited: false } || _fProcess is { HasExited: false };
 
@@ -110,7 +119,7 @@ public sealed partial class Suppressor : IDisposable
 
         EnsureSourceExists();
 
-        _runtime = SuppressRuntimeService.Resolve(_options.FfmpegPath);
+        _runtime = SuppressRuntimeService.Resolve(_options.FfmpegPath, _options.PreferFfmpegPipeline);
 
         _frameCount = 0;
         _fps = 0;
@@ -167,6 +176,15 @@ public sealed partial class Suppressor : IDisposable
         {
             // 同上。
         }
+
+        try
+        {
+            if (_vLogTask != null) await _vLogTask.ConfigureAwait(false);
+        }
+        catch
+        {
+            // 同上。
+        }
     }
 
     private void StartLegacyPipeline()
@@ -184,6 +202,7 @@ public sealed partial class Suppressor : IDisposable
 
         _pipeTask = Task.Run(() => RunPipe(_cts!.Token));
         _logTask = Task.Run(() => RunLogReader(_cts!.Token));
+        _vLogTask = Task.Run(() => RunVapourLogReader(_cts!.Token));
     }
 
     private void StartFfmpegPipeline()
@@ -235,6 +254,12 @@ public sealed partial class Suppressor : IDisposable
             {
                 try { await _logTask.ConfigureAwait(false); }
                 catch { /* 已经在 RunLogReader 内吞，外层留底。 */ }
+            }
+
+            if (_vLogTask != null)
+            {
+                try { await _vLogTask.ConfigureAwait(false); }
+                catch { /* 同上。 */ }
             }
 
             if (_pipeTask != null)
@@ -367,6 +392,27 @@ public sealed partial class Suppressor : IDisposable
         }
     }
 
+    private void RunVapourLogReader(CancellationToken token)
+    {
+        if (_vProcess == null) return;
+        var stderr = _vProcess.StandardError;
+
+        try
+        {
+            string? line;
+            while (!token.IsCancellationRequested && (line = stderr.ReadLine()) != null)
+            {
+                _callbacks.OnLogLine?.Invoke("[VSPipe] " + line);
+                _lastLogLineWasProgress = false;
+            }
+        }
+        catch (Exception ex) when (
+            ex is IOException or ObjectDisposedException or OperationCanceledException)
+        {
+            // 进程被关闭时 ReadLine 会抛，吞。
+        }
+    }
+
     private void AnalysisLog(string log)
     {
         if (FfmpegProgressPattern().IsMatch(log))
@@ -430,7 +476,11 @@ public sealed partial class Suppressor : IDisposable
                 CreateNoWindow = true,
                 RedirectStandardInput = false,
                 RedirectStandardOutput = true,
-                RedirectStandardError = false,
+                // VSPipe 启动失败（脚本报错/插件缺失）时 stdout 一个字节都不会有，
+                // ffmpeg 那头只会报 "yuv4mpegpipe … Header too large."——真正的原因
+                // 在 VSPipe 的 stderr 里，必须捕获转发进日志（RunVapourLogReader）。
+                RedirectStandardError = true,
+                StandardErrorEncoding = Encoding.UTF8,
             },
         };
 
@@ -667,17 +717,22 @@ public sealed partial class Suppressor : IDisposable
                 args.Add("-tag:v");
                 args.Add("hvc1");
                 break;
+            // NVENC 三兄弟统一走恒定质量：-rc vbr -cq N 必须配 -b:v 0，否则 ffmpeg
+            // 默认 200k 平均码率会当作 vbr 目标把画面压糊。p4/hq 是离线成片档；
+            // 旧的 p1+ull 是直播延迟档（禁 B 帧），成品质量差一截。
             case VideoEncoder.H264Nvenc:
                 args.Add("-c:v");
                 args.Add("h264_nvenc");
                 args.Add("-preset");
-                args.Add("p1");
+                args.Add("p4");
                 args.Add("-tune");
-                args.Add("ull");
+                args.Add("hq");
                 args.Add("-rc");
                 args.Add("vbr");
                 args.Add("-cq");
                 args.Add(_options.Crf.ToString());
+                args.Add("-b:v");
+                args.Add("0");
                 args.Add("-profile:v");
                 args.Add("high");
                 args.Add("-multipass");
@@ -687,13 +742,15 @@ public sealed partial class Suppressor : IDisposable
                 args.Add("-c:v");
                 args.Add("hevc_nvenc");
                 args.Add("-preset");
-                args.Add("p1");
+                args.Add("p4");
                 args.Add("-tune");
-                args.Add("ull");
+                args.Add("hq");
                 args.Add("-rc");
                 args.Add("vbr");
                 args.Add("-cq");
                 args.Add(_options.Crf.ToString());
+                args.Add("-b:v");
+                args.Add("0");
                 args.Add("-multipass");
                 args.Add("0");
                 args.Add("-tag:v");
@@ -727,13 +784,15 @@ public sealed partial class Suppressor : IDisposable
                 args.Add("-c:v");
                 args.Add("av1_nvenc");
                 args.Add("-preset");
-                args.Add("p1");
+                args.Add("p4");
                 args.Add("-tune");
-                args.Add("ull");
+                args.Add("hq");
                 args.Add("-rc");
                 args.Add("vbr");
                 args.Add("-cq");
                 args.Add(_options.Crf.ToString());
+                args.Add("-b:v");
+                args.Add("0");
                 args.Add("-multipass");
                 args.Add("0");
                 break;
@@ -743,6 +802,53 @@ public sealed partial class Suppressor : IDisposable
                 args.Add("-global_quality");
                 args.Add(_options.Crf.ToString());
                 break;
+            // AMF（AMD 显卡）统一 CQP：恒定 QP 不受码率参数影响，是 AMF 各代驱动上
+            // 行为最稳的恒质量方式。h264/hevc 的 QP 与 CRF 同为 0-51 标度可直用。
+            case VideoEncoder.H264Amf:
+                args.Add("-c:v");
+                args.Add("h264_amf");
+                args.Add("-quality");
+                args.Add("quality");
+                args.Add("-rc");
+                args.Add("cqp");
+                args.Add("-qp_i");
+                args.Add(_options.Crf.ToString());
+                args.Add("-qp_p");
+                args.Add(_options.Crf.ToString());
+                args.Add("-qp_b");
+                args.Add(_options.Crf.ToString());
+                break;
+            case VideoEncoder.HevcAmf:
+                args.Add("-c:v");
+                args.Add("hevc_amf");
+                args.Add("-quality");
+                args.Add("quality");
+                args.Add("-rc");
+                args.Add("cqp");
+                args.Add("-qp_i");
+                args.Add(_options.Crf.ToString());
+                args.Add("-qp_p");
+                args.Add(_options.Crf.ToString());
+                args.Add("-tag:v");
+                args.Add("hvc1");
+                break;
+            case VideoEncoder.Av1Amf:
+            {
+                // av1_amf 的 QP 是 0-255 标度（h264/hevc 是 0-51），CRF 值按 ×4 映射，
+                // 封顶 255；21 → 84 与 hevc CRF21 的观感大致相当。
+                var av1Qp = Math.Min(255, Math.Max(0, _options.Crf) * 4).ToString();
+                args.Add("-c:v");
+                args.Add("av1_amf");
+                args.Add("-quality");
+                args.Add("quality");
+                args.Add("-rc");
+                args.Add("cqp");
+                args.Add("-qp_i");
+                args.Add(av1Qp);
+                args.Add("-qp_p");
+                args.Add(av1Qp);
+                break;
+            }
             case VideoEncoder.LibSvtAv1:
                 args.Add("-c:v");
                 args.Add("libsvtav1");

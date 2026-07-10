@@ -1,7 +1,10 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 using SekaiToolsCore;
 
@@ -32,9 +35,14 @@ public static class SuppressRuntimeService
     private static readonly string[] VapourExecutableNames =
         OperatingSystem.IsWindows() ? ["VSPipe.exe"] : ["VSPipe", "vspipe"];
 
-    public static SuppressRuntimeProbe Probe(string? ffmpegPathHint = null)
+    // preferFfmpeg：优先纯 ffmpeg 管线，机器上残留的 VapourSynth 只作兜底。
+    // SekaiText 引擎（IPC）必须传 true——用户目录里老 SekaiTools 装的 VSPipe 版本不受
+    // 我们控制，坏掉时 VSPipe 无输出、ffmpeg 只会报一句莫名其妙的
+    // "yuv4mpegpipe … Header too large."；而且那条管线用 VSFilter 烧字幕，
+    // 拿不到我们随引擎发布的字体。Avalonia 桌面版保持默认 false（老行为）。
+    public static SuppressRuntimeProbe Probe(string? ffmpegPathHint = null, bool preferFfmpeg = false)
     {
-        if (TryResolveVapourSynth(ffmpegPathHint, out var legacyDescriptor, out var legacyMessage))
+        if (!preferFfmpeg && TryResolveVapourSynth(ffmpegPathHint, out var legacyDescriptor, out var legacyMessage))
             return new SuppressRuntimeProbe(true, legacyMessage, legacyDescriptor);
 
         if (TryResolveFfmpeg(ffmpegPathHint, out var ffmpegPath, out var ffmpegMessage))
@@ -43,43 +51,63 @@ public static class SuppressRuntimeService
                 new SuppressRuntimeDescriptor(SuppressBackend.Ffmpeg, ffmpegPath));
         }
 
+        if (preferFfmpeg && TryResolveVapourSynth(ffmpegPathHint, out var fallbackDescriptor, out var fallbackMessage))
+            return new SuppressRuntimeProbe(true, fallbackMessage, fallbackDescriptor);
+
         return new SuppressRuntimeProbe(false, BuildFailureMessage());
     }
 
-    public static SuppressRuntimeDescriptor Resolve(string? ffmpegPathHint = null)
+    public static SuppressRuntimeDescriptor Resolve(string? ffmpegPathHint = null, bool preferFfmpeg = false)
     {
-        var probe = Probe(ffmpegPathHint);
+        var probe = Probe(ffmpegPathHint, preferFfmpeg);
         if (!probe.IsReady || probe.Descriptor is null)
             throw new FileNotFoundException(probe.Message);
 
         return probe.Descriptor;
     }
 
-    public static async Task<List<VideoEncoder>> ProbeAvailableEncodersAsync(string? ffmpegPathHint = null)
+    // 硬件编码器仅"编译进 ffmpeg"不代表能用——Windows 全量构建三家（NVENC/QSV/AMF）
+    // 都编进去了，真正可用性取决于插的是哪块显卡。因此每个硬件编码器都用一次
+    // 微型试编码（lavfi 黑帧 → -f null）验证驱动真的能初始化，失败的剔除。
+    // 结果按 ffmpeg 路径缓存：同一引擎进程内只探测一次。
+    private static readonly Dictionary<string, VideoEncoder> HardwareEncoderMap = new()
     {
+        ["h264_videotoolbox"] = VideoEncoder.H264VideoToolbox,
+        ["hevc_videotoolbox"] = VideoEncoder.HevcVideoToolbox,
+        ["h264_nvenc"] = VideoEncoder.H264Nvenc,
+        ["hevc_nvenc"] = VideoEncoder.HevcNvenc,
+        ["av1_nvenc"] = VideoEncoder.Av1Nvenc,
+        ["h264_qsv"] = VideoEncoder.H264Qsv,
+        ["hevc_qsv"] = VideoEncoder.HevcQsv,
+        ["av1_qsv"] = VideoEncoder.Av1Qsv,
+        ["h264_amf"] = VideoEncoder.H264Amf,
+        ["hevc_amf"] = VideoEncoder.HevcAmf,
+        ["av1_amf"] = VideoEncoder.Av1Amf,
+    };
+
+    private static readonly Dictionary<string, VideoEncoder> SoftwareEncoderMap = new()
+    {
+        ["libx265"] = VideoEncoder.Libx265,
+        ["libsvtav1"] = VideoEncoder.LibSvtAv1,
+    };
+
+    private static readonly ConcurrentDictionary<string, Task<List<VideoEncoder>>> EncoderProbeCache = new();
+
+    public static Task<List<VideoEncoder>> ProbeAvailableEncodersAsync(string? ffmpegPathHint = null)
+    {
+        if (!TryResolveFfmpeg(ffmpegPathHint, out var ffmpegPath, out _))
+            return Task.FromResult(new List<VideoEncoder> { VideoEncoder.Libx264 });
+
+        // GetOrAdd 的 valueFactory 可能并发跑两次，但探测幂等、只是浪费几秒，无需加锁。
+        return EncoderProbeCache.GetOrAdd(ffmpegPath, ProbeEncodersUncachedAsync);
+    }
+
+    private static async Task<List<VideoEncoder>> ProbeEncodersUncachedAsync(string ffmpegPath)
+    {
+        // x264 是所有构建的保底编码器，永远在列。
         var available = new List<VideoEncoder> { VideoEncoder.Libx264 };
 
-        if (!TryResolveFfmpeg(ffmpegPathHint, out var ffmpegPath, out _))
-            return available;
-
-        var encoderMap = new Dictionary<string, VideoEncoder>
-        {
-            ["h264_videotoolbox"] = VideoEncoder.H264VideoToolbox,
-            ["hevc_videotoolbox"] = VideoEncoder.HevcVideoToolbox,
-            ["h264_nvenc"] = VideoEncoder.H264Nvenc,
-            ["hevc_nvenc"] = VideoEncoder.HevcNvenc,
-            ["av1_nvenc"] = VideoEncoder.Av1Nvenc,
-            ["h264_qsv"] = VideoEncoder.H264Qsv,
-            ["hevc_qsv"] = VideoEncoder.HevcQsv,
-            ["av1_qsv"] = VideoEncoder.Av1Qsv,
-        };
-
-        var softwareMap = new Dictionary<string, VideoEncoder>
-        {
-            ["libx265"] = VideoEncoder.Libx265,
-            ["libsvtav1"] = VideoEncoder.LibSvtAv1,
-        };
-
+        string output;
         try
         {
             var psi = new ProcessStartInfo(ffmpegPath)
@@ -95,27 +123,129 @@ public static class SuppressRuntimeService
             using var proc = Process.Start(psi);
             if (proc == null) return available;
 
-            var output = await proc.StandardOutput.ReadToEndAsync();
+            var stderrDrain = proc.StandardError.ReadToEndAsync();
+            output = await proc.StandardOutput.ReadToEndAsync();
             await proc.WaitForExitAsync();
-
-            foreach (var (name, encoder) in encoderMap)
-            {
-                if (output.Contains(name))
-                    available.Add(encoder);
-            }
-
-            foreach (var (name, encoder) in softwareMap)
-            {
-                if (output.Contains(name))
-                    available.Add(encoder);
-            }
+            await stderrDrain;
         }
         catch
         {
-            // probe 失败不阻塞
+            return available; // probe 失败不阻塞，保底 x264
+        }
+
+        foreach (var (name, encoder) in SoftwareEncoderMap)
+        {
+            if (output.Contains(name))
+                available.Add(encoder);
+        }
+
+        // 编译进构建的硬件编码器并发试编码；跨家族并发没问题（各自初始化各自的驱动栈）。
+        var candidates = new List<(string Name, VideoEncoder Encoder)>();
+        foreach (var (name, encoder) in HardwareEncoderMap)
+        {
+            if (output.Contains(name))
+                candidates.Add((name, encoder));
+        }
+
+        var checks = candidates
+            .Select(async c => (c.Encoder, Ok: await VerifyEncoderAsync(ffmpegPath, c.Name)))
+            .ToList();
+        foreach (var check in checks)
+        {
+            var (encoder, ok) = await check;
+            if (ok)
+                available.Add(encoder);
         }
 
         return available;
+    }
+
+    /// <summary>用几帧黑场真实跑一遍编码器，验证对应硬件/驱动确实存在且能初始化。</summary>
+    private static async Task<bool> VerifyEncoderAsync(string ffmpegPath, string encoderName)
+    {
+        Process? proc = null;
+        try
+        {
+            var psi = new ProcessStartInfo(ffmpegPath)
+            {
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+            };
+            // 640x360：高于所有硬件编码器的最小分辨率限制，又足够小到瞬间完成。
+            psi.ArgumentList.Add("-hide_banner");
+            psi.ArgumentList.Add("-loglevel");
+            psi.ArgumentList.Add("error");
+            psi.ArgumentList.Add("-f");
+            psi.ArgumentList.Add("lavfi");
+            psi.ArgumentList.Add("-i");
+            psi.ArgumentList.Add("color=black:s=640x360:r=30:d=0.2");
+            psi.ArgumentList.Add("-frames:v");
+            psi.ArgumentList.Add("3");
+            psi.ArgumentList.Add("-an");
+            psi.ArgumentList.Add("-c:v");
+            psi.ArgumentList.Add(encoderName);
+            psi.ArgumentList.Add("-f");
+            psi.ArgumentList.Add("null");
+            psi.ArgumentList.Add("-");
+
+            proc = Process.Start(psi);
+            if (proc == null) return false;
+
+            var drain = Task.WhenAll(
+                proc.StandardOutput.ReadToEndAsync(),
+                proc.StandardError.ReadToEndAsync());
+
+            // 坏驱动可能在初始化里挂死——超时按不可用处理并回收进程。
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+            await proc.WaitForExitAsync(cts.Token);
+            await drain;
+            return proc.ExitCode == 0;
+        }
+        catch
+        {
+            try
+            {
+                if (proc is { HasExited: false }) proc.Kill(entireProcessTree: true);
+            }
+            catch
+            {
+                // 已退出/句柄失效，忽略。
+            }
+
+            return false;
+        }
+        finally
+        {
+            proc?.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// 从可用列表里挑默认编码器：优先本平台的 HEVC 硬编（质量/体积比好、够快），
+    /// 依次退到 H264 硬编，最后保底 x264 软编。列表为空或全不认识时也回 x264。
+    /// </summary>
+    public static VideoEncoder RecommendEncoder(IReadOnlyCollection<VideoEncoder> available)
+    {
+        VideoEncoder[] preference = OperatingSystem.IsMacOS()
+            ?
+            [
+                VideoEncoder.HevcVideoToolbox, VideoEncoder.H264VideoToolbox,
+            ]
+            :
+            [
+                VideoEncoder.HevcNvenc, VideoEncoder.HevcQsv, VideoEncoder.HevcAmf,
+                VideoEncoder.H264Nvenc, VideoEncoder.H264Qsv, VideoEncoder.H264Amf,
+            ];
+
+        foreach (var encoder in preference)
+        {
+            if (available.Contains(encoder))
+                return encoder;
+        }
+
+        return VideoEncoder.Libx264;
     }
 
     private static bool TryResolveVapourSynth(

@@ -13,6 +13,9 @@ public enum VideoEncoder
     H264Qsv,
     HevcQsv,
     Av1Qsv,
+    H264Amf,
+    HevcAmf,
+    Av1Amf,
 }
 
 public static class VideoEncoderExtensions
@@ -30,6 +33,9 @@ public static class VideoEncoderExtensions
         VideoEncoder.H264Qsv => "H264 QSV",
         VideoEncoder.HevcQsv => "HEVC QSV",
         VideoEncoder.Av1Qsv => "AV1 QSV",
+        VideoEncoder.H264Amf => "H264 AMF",
+        VideoEncoder.HevcAmf => "HEVC AMF",
+        VideoEncoder.Av1Amf => "AV1 AMF",
         _ => encoder.ToString(),
     };
 }

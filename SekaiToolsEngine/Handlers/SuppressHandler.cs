@@ -1,3 +1,4 @@
+using System.Linq;
 using System.Text.Json;
 using SekaiToolsApp.Services;
 using SekaiToolsEngine.Ipc;
@@ -40,6 +41,10 @@ public sealed class SuppressHandler
                 : VideoEncoder.Libx264,
             UseHwAccelDecode = !p.TryGetProperty("useHwAccelDecode", out var hw)
                                || hw.ValueKind != JsonValueKind.False,
+            // SekaiText 走 IPC 时永远用自带 ffmpeg 的纯 ffmpeg 管线：老 SekaiTools 在
+            // 用户目录残留的 VapourSynth 会被自动探测抢走压制（坏掉时只报
+            // "Header too large."，且 VSFilter 拿不到随引擎发布的字幕字体）。
+            PreferFfmpegPipeline = true,
         };
 
         var callbacks = new SuppressorCallbacks
@@ -67,16 +72,26 @@ public sealed class SuppressHandler
         return "ok";
     }
 
-    private Task<object?> ProbeAsync(JsonElement? @params)
+    private async Task<object?> ProbeAsync(JsonElement? @params)
     {
         var hint = @params?.TryGetProperty("ffmpegPath", out var fp) == true ? fp.GetString() : null;
-        var probe = Suppressor.ProbeRuntime(hint);
-        return Task.FromResult<object?>(new
+        // 与 StartAsync 同一偏好（ffmpeg 优先），否则探测报的后端和实际跑的不一致。
+        var probe = Suppressor.ProbeRuntime(hint, preferFfmpeg: true);
+
+        // 逐个试编码验证硬件真的在（结果按 ffmpeg 路径缓存，进程内只跑一次）；
+        // recommended 按平台挑最优硬编，客户端用它当默认值——Windows 上再也不会
+        // 默认到 macOS 专属的 VideoToolbox。
+        var encoders = await SuppressRuntimeService.ProbeAvailableEncodersAsync(hint);
+        var recommended = SuppressRuntimeService.RecommendEncoder(encoders);
+
+        return new
         {
             available = probe.IsReady,
             message = probe.Message,
             backend = probe.Descriptor?.Backend.ToString(),
             ffmpegPath = probe.Descriptor?.FfmpegPath,
-        });
+            encoders = encoders.Select(e => e.ToString()).ToArray(),
+            recommended = recommended.ToString(),
+        };
     }
 }
