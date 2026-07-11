@@ -139,7 +139,10 @@ public static class SuppressRuntimeService
                 available.Add(encoder);
         }
 
-        // 编译进构建的硬件编码器并发试编码；跨家族并发没问题（各自初始化各自的驱动栈）。
+        // 编译进构建的硬件编码器逐个试编码。同家族（NVENC/QSV/AMF/VideoToolbox）必须
+        // 串行：同一驱动栈并发初始化编码会话会互踩——AMF 并发 InitDX11 直接
+        // AVERROR(ENODEV)=-19、NVENC 消费级卡有并发会话数上限——导致本来可用的编码器
+        // 被概率性误判剔除。不同家族各有各的驱动栈，跨家族保持并发不拖慢首跑。
         var candidates = new List<(string Name, VideoEncoder Encoder)>();
         foreach (var (name, encoder) in HardwareEncoderMap)
         {
@@ -147,17 +150,31 @@ public static class SuppressRuntimeService
                 candidates.Add((name, encoder));
         }
 
-        var checks = candidates
-            .Select(async c => (c.Encoder, Ok: await VerifyEncoderAsync(ffmpegPath, c.Name)))
+        var groupChecks = candidates
+            .GroupBy(c => EncoderVendor(c.Name))
+            .Select(async group =>
+            {
+                var ok = new List<VideoEncoder>();
+                foreach (var (name, encoder) in group)
+                {
+                    if (await VerifyEncoderAsync(ffmpegPath, name))
+                        ok.Add(encoder);
+                }
+
+                return ok;
+            })
             .ToList();
-        foreach (var check in checks)
-        {
-            var (encoder, ok) = await check;
-            if (ok)
-                available.Add(encoder);
-        }
+        foreach (var check in groupChecks)
+            available.AddRange(await check);
 
         return available;
+    }
+
+    /// <summary>ffmpeg 硬件编码器命名恒为 codec_vendor（如 hevc_nvenc），取家族名分组。</summary>
+    private static string EncoderVendor(string encoderName)
+    {
+        var idx = encoderName.IndexOf('_');
+        return idx >= 0 ? encoderName[(idx + 1)..] : encoderName;
     }
 
     /// <summary>用几帧黑场真实跑一遍编码器，验证对应硬件/驱动确实存在且能初始化。</summary>
@@ -235,8 +252,13 @@ public static class SuppressRuntimeService
             ]
             :
             [
-                VideoEncoder.HevcNvenc, VideoEncoder.HevcQsv, VideoEncoder.HevcAmf,
-                VideoEncoder.H264Nvenc, VideoEncoder.H264Qsv, VideoEncoder.H264Amf,
+                // Windows/Linux：独显优先——NVENC（N 卡）与 AMF（A 卡）整组排在
+                // QSV（绝大多数机器上是 CPU 核显）前面：双显卡机器上核显吞吐/画质
+                // 都不如独显，不该因为"HEVC"标签就把推荐落到核显上。
+                // 同一块卡内部 HEVC 优先于 H264。
+                VideoEncoder.HevcNvenc, VideoEncoder.HevcAmf,
+                VideoEncoder.H264Nvenc, VideoEncoder.H264Amf,
+                VideoEncoder.HevcQsv, VideoEncoder.H264Qsv,
             ];
 
         foreach (var encoder in preference)

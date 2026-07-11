@@ -195,6 +195,10 @@ public sealed partial class Suppressor : IDisposable
         _vProcess = CreateVapourProcess(_runtime.VapourSynthPath!, _runtime.VapourScriptPath!);
         _fProcess = CreateLegacyFfmpegProcess(_runtime.FfmpegPath);
 
+        // 完整命令行进日志：报错时（自动导出的日志里）能直接复现/定位参数问题。
+        LogCommandLine(_vProcess, "VSPipe");
+        LogCommandLine(_fProcess, "ffmpeg");
+
         _vProcess.Start();
         _fProcess.Start();
         BoostProcessPriority(_vProcess);
@@ -211,10 +215,19 @@ public sealed partial class Suppressor : IDisposable
             throw new InvalidOperationException("压制运行环境尚未解析。");
 
         _fProcess = CreateFfmpegOnlyProcess(_runtime.FfmpegPath);
+        LogCommandLine(_fProcess, "ffmpeg");
         _fProcess.Start();
         BoostProcessPriority(_fProcess);
 
         _logTask = Task.Run(() => RunLogReader(_cts!.Token));
+    }
+
+    private void LogCommandLine(Process process, string name)
+    {
+        var args = string.Join(' ',
+            process.StartInfo.ArgumentList.Select(a =>
+                a.Length > 0 && !a.Contains(' ') && !a.Contains('"') ? a : "\"" + a.Replace("\"", "\\\"") + "\""));
+        _callbacks.OnLogLine?.Invoke($"[Sekai] {name} 命令行: {process.StartInfo.FileName} {args}");
     }
 
     private async Task WaitForExitAsync()

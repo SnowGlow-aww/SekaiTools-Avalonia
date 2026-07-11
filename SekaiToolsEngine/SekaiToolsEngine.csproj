@@ -10,7 +10,7 @@
              The project dir/csproj/namespace stay SekaiToolsEngine to avoid churn;
              only the emitted apphost is renamed. -->
         <AssemblyName>SekaiCoreEngine</AssemblyName>
-        <Version>2.1.0</Version>
+        <Version>2.2.0</Version>
         <RuntimeIdentifiers>osx-arm64;win-x64</RuntimeIdentifiers>
         <PublishSingleFile>true</PublishSingleFile>
         <SelfContained>true</SelfContained>
