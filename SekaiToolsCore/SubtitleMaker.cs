@@ -271,8 +271,11 @@ public class SubtitleMaker(VideoInfo videoInfo, TemplateManager templateManager,
             sepSet2.Frames.AddRange(dialogBaseFrameSet.Frames[sepCount..]);
 
             var content = dialogBaseFrameSet.Data.FinalContent.TrimAll();
-            sepSet1.Data.BodyTranslated = content[..dialogBaseFrameSet.Separate.SeparatorContentIndex];
-            sepSet2.Data.BodyTranslated = content[dialogBaseFrameSet.Separate.SeparatorContentIndex..];
+            // SeparatorContentIndex 是按分隔时的译文长度算的，TrimAll 后内容可能变短（首行空格结尾+Enter
+            // 让次行为空等换行），未夹取会让切片越界抛异常中断整个 ass 导出；夹到合法区间后退化为不分隔而不崩。
+            var sepContentIndex = Math.Clamp(dialogBaseFrameSet.Separate.SeparatorContentIndex, 0, content.Length);
+            sepSet1.Data.BodyTranslated = content[..sepContentIndex];
+            sepSet2.Data.BodyTranslated = content[sepContentIndex..];
 
             return [sepSet1, sepSet2];
         }

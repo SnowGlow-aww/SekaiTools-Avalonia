@@ -159,6 +159,18 @@ public class VideoProcessor : IDisposable
     public void Dispose()
     {
         TokenSource?.Cancel();
+        // 释放原生 Capture 前先等后台识别线程真正退出：Process 在另一线程持 capture 并发 Read，
+        // 句柄被并发释放会 use-after-free 崩溃。Dispose 由调度线程调用（非 ProcessingTask），
+        // 且必须在不持 SubtitleHandler 结果锁时调用，否则会与 OnNewDialog 抢锁死锁。
+        try
+        {
+            ProcessingTask?.Wait(TimeSpan.FromSeconds(10));
+        }
+        catch
+        {
+            // 后台任务异常已在 Process 内经回调上报；此处吞掉 Wait 抛出的聚合异常/取消。
+        }
+
         TokenSource?.Dispose();
         TokenSource = null;
         Capture?.Dispose();
@@ -246,10 +258,15 @@ public class VideoProcessor : IDisposable
 
                 EmitProgressIfNeeded(progress);
 
-                if (frameIndex % previewInterval == 0)
+                if (frameIndex % previewInterval == 0 && _previewChannel is { } previewChannel)
                 {
+                    // 通道容量 1、DropOldest：被挤掉的旧克隆帧既不回传也不释放，整帧 Mat（~6MB）只能等 GC。
+                    // 写入前先取走未消费的旧帧显式释放，避免生产快于消费时堆积泄漏。
+                    while (previewChannel.Reader.TryRead(out var stale))
+                        stale.Dispose();
                     var previewFrame = frame.Clone();
-                    _ = _previewChannel?.Writer.TryWrite(previewFrame);
+                    if (!previewChannel.Writer.TryWrite(previewFrame))
+                        previewFrame.Dispose();
                 }
 
                 FrameProcess.Process(frame);

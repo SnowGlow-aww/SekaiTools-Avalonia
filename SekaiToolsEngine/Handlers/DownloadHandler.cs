@@ -69,7 +69,9 @@ public sealed class DownloadHandler
     {
         try
         {
-            using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(15) };
+            // 6s 而非 15s：source.json 只是可选的远程源覆盖，config.g.xbb.moe 若不可达
+            // （裸连不通/需代理）应快速失败回退内置默认源，不让用户干等。
+            using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(6) };
             var json = await http.GetStringAsync(SourceListUrl);
             var remote = System.Text.Json.JsonSerializer.Deserialize<SourceData[]>(json);
             if (remote is { Length: > 0 })
@@ -132,6 +134,9 @@ public sealed class DownloadHandler
             ListCardStory.Instance.SetProxy(proxy);
             ListActionStory.Instance.SetProxy(proxy);
             ListGreetStory.Instance.SetProxy(proxy);
+            // ResourceManager 是打轴模板/字体资源的独立下载器（与上面的 story-data Fetcher 分家），
+            // 之前漏设代理→用户配了代理仍直连 resource.g.xbb.moe 拉模板/字体，代理网络下打轴失败。
+            SekaiToolsCore.ResourceManager.Instance.SetProxy(proxy);
         }
         return Task.FromResult<object?>("ok");
     }

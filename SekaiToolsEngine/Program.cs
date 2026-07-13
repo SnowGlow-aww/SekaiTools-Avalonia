@@ -2,6 +2,9 @@ using SekaiToolsEngine.Ipc;
 using SekaiToolsEngine.Handlers;
 
 var transport = new IpcTransport(Console.OpenStandardInput(), Console.OpenStandardOutput());
+// transport 已独占持有真实 stdout 作为 NDJSON 通道；把 Console 默认输出改到 stderr，
+// 让共享库 Logger 与任何 Console.WriteLine 都不再向 stdout 写明文撕裂 JSON。
+Console.SetOut(new StreamWriter(Console.OpenStandardError()) { AutoFlush = true });
 var dispatcher = new Dispatcher();
 
 var subtitleHandler = new SubtitleHandler(transport);

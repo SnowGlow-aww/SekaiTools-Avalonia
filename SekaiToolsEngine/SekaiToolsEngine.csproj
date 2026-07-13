@@ -10,7 +10,7 @@
              The project dir/csproj/namespace stay SekaiToolsEngine to avoid churn;
              only the emitted apphost is renamed. -->
         <AssemblyName>SekaiCoreEngine</AssemblyName>
-        <Version>2.2.0</Version>
+        <Version>2.3.0</Version>
         <RuntimeIdentifiers>osx-arm64;win-x64</RuntimeIdentifiers>
         <PublishSingleFile>true</PublishSingleFile>
         <SelfContained>true</SelfContained>
@@ -28,6 +28,13 @@
              压制时通过 subtitles 滤镜的 fontsdir 交给 libass，保证没装字体的机器
              也能压出正确字形（否则 macOS 会静默回退苹方，字幕整体变窄）。 -->
         <Content Include="..\resource\fonts\**" Link="fonts\%(Filename)%(Extension)"
+                 CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+        <!-- 打轴模板/字体（VideoProcess 资源：FOT-Rodin DB/EB 字体 + 菜单模板 + 阈值）随引擎内置发布：
+             ResourceManager 按 缓存→内置→联网 三级回退取用，干净机器首跑打轴零联网，
+             不再依赖 resource.g.xbb.moe（该域名裸连不通、需代理）。清单 videoProcess.json 一并内置。 -->
+        <Content Include="..\resource\videoProcess\**" Link="videoProcess\%(Filename)%(Extension)"
+                 CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+        <Content Include="..\resource\videoProcess.json" Link="videoProcess.json"
                  CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
     </ItemGroup>
 

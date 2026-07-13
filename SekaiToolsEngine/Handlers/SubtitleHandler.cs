@@ -90,10 +90,21 @@ public sealed class SubtitleHandler
             _videoPath = videoPath;
         }
 
+        // 先把上一段视频的 processor 摘出来在锁外停止并释放：Dispose 会等其识别线程结束，
+        // 而该线程的 OnNewDialog 回调要抢 _lock，若持锁等待会死锁。等旧线程真正退出后再清空
+        // 结果、建新任务，才能杜绝句柄被并发释放崩溃与旧对话串进本次结果。
+        VideoProcessor? previous;
         lock (_lock)
         {
-            _processor?.StopProcess();
-            _processor?.Dispose(); // 释放上一段视频的 VideoCapture/Token，避免连打多个视频时句柄堆积
+            previous = _processor;
+            _processor = null;
+        }
+
+        previous?.StopProcess();
+        previous?.Dispose(); // 释放上一段视频的 VideoCapture/Token 并等识别线程退出，避免连打多个视频时句柄堆积/并发释放
+
+        lock (_lock)
+        {
             _dialogs.Clear();
             _banners.Clear();
             _markers.Clear();

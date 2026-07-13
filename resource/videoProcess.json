@@ -1,0 +1,22 @@
+[
+    {
+        "path": "videoProcess/FOT-RodinNTLGPro-DB.otf",
+        "size": 3440008,
+        "md5": "988fe470990ef59b503df72393e0ab34"
+    },
+    {
+        "path": "videoProcess/FOT-RodinNTLGPro-EB.otf",
+        "size": 3823332,
+        "md5": "f0f22554d457ec549b295dc8a6da0367"
+    },
+    {
+        "path": "videoProcess/menu-107px.png",
+        "size": 6552,
+        "md5": "3d42a217a688e96948f36307c1a50ea9"
+    },
+    {
+        "path": "videoProcess/thresholds.json",
+        "size": 195,
+        "md5": "f5a1746b761941ee9a5c26f1616cf1f0"
+    }
+]
