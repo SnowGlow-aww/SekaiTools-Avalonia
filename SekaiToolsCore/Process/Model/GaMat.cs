@@ -4,7 +4,7 @@ using Emgu.CV.CvEnum;
 
 namespace SekaiToolsCore.Process.Model;
 
-public class GaMat // Gray and Alpha Mat
+public class GaMat : IDisposable // Gray and Alpha Mat
 {
     public readonly Mat Alpha;
     public readonly Mat Gray;
@@ -30,4 +30,14 @@ public class GaMat // Gray and Alpha Mat
     }
 
     public Size Size => Gray.Size;
+
+    // Releases the two native Mats this wrapper owns. Cached GaMats (TemplateManager's
+    // GaMat cache) live for the whole run and are not disposed per-call; only one-shot
+    // GaMats created outside the cache (e.g. SubtitleMaker name-tag width probes) are
+    // wrapped in `using` so they don't accumulate.
+    public void Dispose()
+    {
+        Gray.Dispose();
+        Alpha.Dispose();
+    }
 }

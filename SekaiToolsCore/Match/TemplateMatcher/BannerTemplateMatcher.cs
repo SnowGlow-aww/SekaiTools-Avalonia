@@ -37,7 +37,7 @@ public class BannerTemplateMatcher(
 
     private GaMat GetTemplate(string content)
     {
-        return new GaMat(templateManager.GetTemplate(TemplateUsage.BannerContent, content));
+        return templateManager.GetGaTemplate(TemplateUsage.BannerContent, content);
     }
 
 
@@ -69,7 +69,7 @@ public class BannerTemplateMatcher(
             new Size((int)(tmp.Size.Height * text.Length * 1.5), (int)(tmp.Size.Height * 1.5)));
         cropArea.Limit(new Rectangle(Point.Empty, src.Size));
         if (cropArea.IsEmpty || cropArea.Width < tmp.Size.Width || cropArea.Height < tmp.Size.Height) return 0;
-        var imgCropped = new Mat(src, cropArea);
+        using var imgCropped = new Mat(src, cropArea);
         // 旧版无任何预滤波；原 LaplaceSharpen(beta=0) 实为空操作(只附带一次灰度转换)，
         // 而 TemplateMatcher.Match 已会按需做 Bgr2Gray，故移除以保持与 1.3.3 一致。
         var result = TemplateMatcher.Match(imgCropped, tmp, TemplateMatchCachePool.MatchUsage.Banner);

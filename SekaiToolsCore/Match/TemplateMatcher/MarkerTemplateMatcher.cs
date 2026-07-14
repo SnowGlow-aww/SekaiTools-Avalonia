@@ -34,9 +34,15 @@ public class MarkerTemplateMatcher(
 
         var mat = templateManager.GetTemplate(TemplateUsage.MarkerContent, content);
         const double resizeRatio = 0.90;
-        CvInvoke.Resize(mat, mat, new Size((int)(mat.Width * resizeRatio), (int)(mat.Height * resizeRatio)));
-        _templates.Add(content, new GaMat(mat));
-        return _templates[content];
+        // Resize into a fresh Mat rather than in-place: `mat` belongs to TemplateManager's
+        // shared _template cache and resizing it in place silently shrinks the cached entry.
+        // `resized` is copied out by GaMat then disposed; the GaMat lives in the local
+        // per-run _templates cache. Pixels are identical to the old in-place resize.
+        using var resized = new Mat();
+        CvInvoke.Resize(mat, resized, new Size((int)(mat.Width * resizeRatio), (int)(mat.Height * resizeRatio)));
+        var ga = new GaMat(resized);
+        _templates.Add(content, ga);
+        return ga;
     }
 
     private MatchResult MarkerMatch(Mat img, string text, int frameIndex = -1)
@@ -61,7 +67,7 @@ public class MarkerTemplateMatcher(
             if (cropArea.IsEmpty)
                 return Point.Empty;
 
-            var imgCropped = new Mat(src, cropArea);
+            using var imgCropped = new Mat(src, cropArea);
             var matchResult =
                 TemplateMatcher.Match(imgCropped, tmp, TemplateMatchCachePool.MatchUsage.Marker, matchingType);
 

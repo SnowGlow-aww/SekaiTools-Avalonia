@@ -2,6 +2,7 @@ using System.Drawing;
 using Emgu.CV;
 using Emgu.CV.CvEnum;
 using Emgu.CV.Structure;
+using SekaiToolsCore.Process.Model;
 using SkiaSharp;
 
 namespace SekaiToolsCore.Match.TemplateMatcher;
@@ -24,6 +25,7 @@ public class TemplateManager(Size videoResolution, bool noScale = false)
     private const string EbFontBase = "FOT-RodinNTLGPro-EB.otf";
 
     private readonly Dictionary<TemplateUsage, Dictionary<string, Mat>?> _template = new();
+    private readonly Dictionary<(TemplateUsage Usage, string Text), GaMat> _gaTemplate = new();
     private readonly Dictionary<string, SKTypeface> _typefaceCache = new();
 
     private Mat? _menuSign;
@@ -225,5 +227,24 @@ public class TemplateManager(Size videoResolution, bool noScale = false)
         var mat = CreateImageWithText(usage, text);
         usageDict[text] = mat;
         return mat;
+    }
+
+    // Cached GaMat (Gray+Alpha) wrapper over a template. The recognition hot path builds
+    // the same few templates every frame; before this cache each frame allocated fresh
+    // Gray+Alpha Mats that were never disposed (the dominant per-frame native leak). The
+    // GaMat only reads its source Mat (CvtColor/ExtractChannel), so it is safe to derive
+    // from the shared _template Mat. Keyed identically to _template; same bounded size.
+    //
+    // Recognition-thread only: all callers (Dialog/Banner matchers) run on the single
+    // recognition thread. The export path (SubtitleMaker) deliberately does NOT use this
+    // cache — it builds one-shot `using` GaMats — so this dictionary needs no locking.
+    public GaMat GetGaTemplate(TemplateUsage usage, string text)
+    {
+        var key = (usage, text);
+        if (_gaTemplate.TryGetValue(key, out var cached)) return cached;
+
+        var ga = new GaMat(GetTemplate(usage, text));
+        _gaTemplate[key] = ga;
+        return ga;
     }
 }

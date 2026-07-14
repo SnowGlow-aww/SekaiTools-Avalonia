@@ -303,9 +303,12 @@ public class SubtitleMaker(VideoInfo videoInfo, TemplateManager templateManager,
 
             var dialogItem = SubtitleEvent.Dialog(body, startTime, endTime, styleName);
 
+            int nameTagWidth;
+            using (var nameTag = GetNameTag(dialogBaseFrameSet.Data.CharacterOriginal))
+                nameTagWidth = nameTag.Size.Width;
             var characterItemPosition =
                 dialogBaseFrameSet.Start().Point +
-                new Size(GetNameTag(dialogBaseFrameSet.Data.CharacterOriginal).Size.Width + 10, 0);
+                new Size(nameTagWidth + 10, 0);
             var characterItemPositionTag = $@"{{\pos({characterItemPosition.X},{characterItemPosition.Y})}}";
             var characterItem = SubtitleEvent.Dialog(
                 characterItemPositionTag + characterName, startTime, endTime, "Character");
@@ -328,6 +331,11 @@ public class SubtitleMaker(VideoInfo videoInfo, TemplateManager templateManager,
             var lastPosition = new Point(0, 0);
             var dialogEvents = new List<SubtitleEvent>();
             var characterEvents = new List<SubtitleEvent>();
+            // Name tag is constant for this dialog — build its width once (and dispose the
+            // GaMat) instead of allocating an undisposed GaMat every jitter frame.
+            int nameTagWidth;
+            using (var nameTag = GetNameTag(dialogBaseFrameSet.Data.CharacterOriginal))
+                nameTagWidth = nameTag.Size.Width;
             foreach (var frame in dialogBaseFrameSet.Frames)
             {
                 var x = style.MarginL;
@@ -348,7 +356,7 @@ public class SubtitleMaker(VideoInfo videoInfo, TemplateManager templateManager,
                 }
                 else
                 {
-                    var offset = GetNameTag(dialogBaseFrameSet.Data.CharacterOriginal).Size.Width;
+                    var offset = nameTagWidth;
                     var position = frame.Point + new Size(offset + 10, 0);
                     var tag = $@"{{\pos({position.X},{position.Y})}}";
 

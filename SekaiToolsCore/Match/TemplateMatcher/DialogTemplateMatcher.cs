@@ -124,7 +124,7 @@ public class DialogTemplateMatcher(
                 point = new Point(nameRes.MaxLoc.X + nameRoi.X, nameRes.MaxLoc.Y + nameRoi.Y);
 
                 // 2) 内容首字(前 1 字)——降阈 max(内容阈值-Δ, 下限)，抓打字机刚落笔的首帧。ROI 同 ProbeDialog 第二步。
-                var contentTpl = new GaMat(templateManager.GetTemplate(TemplateUsage.DialogContent, body[..1]));
+                var contentTpl = templateManager.GetGaTemplate(TemplateUsage.DialogContent, body[..1]);
                 var contentThr = Math.Max(
                     (dialogBase.Data.Shake
                         ? config.MatchingThreshold.DialogContentSpecial
@@ -153,7 +153,7 @@ public class DialogTemplateMatcher(
 
     private GaMat GetNameTag(string name)
     {
-        return new GaMat(templateManager.GetTemplate(TemplateUsage.DialogNameTag, name));
+        return templateManager.GetGaTemplate(TemplateUsage.DialogNameTag, name);
     }
 
     private Point DialogMatchNameTag(Mat img, DialogBaseFrameSet dialogBase, int frameIndex = -1)
@@ -165,7 +165,7 @@ public class DialogTemplateMatcher(
 
         var roi = NameTagCropArea(template.Size, dialogBase.Data.Shake);
         if (roi.IsEmpty || roi.Width < template.Size.Width || roi.Height < template.Size.Height) return Point.Empty;
-        var imgCropped = new Mat(img, roi);
+        using var imgCropped = new Mat(img, roi);
         var result = TemplateMatcher.Match(imgCropped, template, TemplateMatchCachePool.MatchUsage.DialogNameTag);
 
         if (frameIndex != -1)
@@ -211,7 +211,7 @@ public class DialogTemplateMatcher(
         var body = dialogBase.Data.BodyOriginal;
         if (string.IsNullOrEmpty(body)) return true; // 无正文则只认名牌
         var prefix = body[..Math.Min(6, body.Length)];
-        var contentTpl = new GaMat(templateManager.GetTemplate(TemplateUsage.DialogContent, prefix));
+        var contentTpl = templateManager.GetGaTemplate(TemplateUsage.DialogContent, prefix);
         var contentThr = dialogBase.Data.Shake
             ? config.MatchingThreshold.DialogContentSpecial
             : config.MatchingThreshold.DialogContentNormal;
@@ -368,7 +368,7 @@ public class DialogTemplateMatcher(
                 dialogStartPosition.Height < tmp.Size.Height)
                 return false;
 
-            var imgCropped = new Mat(src, dialogStartPosition);
+            using var imgCropped = new Mat(src, dialogStartPosition);
             var result = TemplateMatcher.Match(imgCropped, tmp, usage);
             score = result.MaxVal;
 
@@ -395,10 +395,12 @@ public class DialogTemplateMatcher(
             var dialogBody1 = content[..1];
             var dialogBody2 = content[..Math.Min(3, content.Length)];
             var dialogBody3 = content[..Math.Min(6, content.Length)];
-            var mat1 = templateManager.GetTemplate(TemplateUsage.DialogContent, dialogBody1);
-            var mat2 = templateManager.GetTemplate(TemplateUsage.DialogContent, dialogBody2);
-            var mat3 = templateManager.GetTemplate(TemplateUsage.DialogContent, dialogBody3);
-            return [new GaMat(mat1), new GaMat(mat2), new GaMat(mat3)];
+            return
+            [
+                templateManager.GetGaTemplate(TemplateUsage.DialogContent, dialogBody1),
+                templateManager.GetGaTemplate(TemplateUsage.DialogContent, dialogBody2),
+                templateManager.GetGaTemplate(TemplateUsage.DialogContent, dialogBody3)
+            ];
         }
     }
 

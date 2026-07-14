@@ -16,17 +16,34 @@ public static class TemplateMatcher
         TemplateMatchingType matchingType = TemplateMatchingType.CcoeffNormed,
         [CallerMemberName] string memberName = "")
     {
-        var img = new Mat();
-        if (imgOriginal.NumberOfChannels == 3)
+        // 3-channel frames need a grayscale copy we own; already-gray callers alias the
+        // source Mat (must not be disposed here). ownsImg tracks which case we're in.
+        var ownsImg = imgOriginal.NumberOfChannels == 3;
+        Mat img;
+        if (ownsImg)
+        {
+            img = new Mat();
             CvInvoke.CvtColor(imgOriginal, img, ColorConversion.Bgr2Gray);
+        }
         else
+        {
             img = imgOriginal;
+        }
 
         var pool = TemplateMatchCachePool.GetPool(usage);
-        if (pool.Query(img, tmp.Size)) return pool.prevResult;
+        if (pool.Query(img, tmp.Size, out var cached))
+        {
+            // Cache hit: the pool already holds an identical prevImg, so this frame's fresh
+            // grayscale copy is redundant. Dispose it now (same thread) instead of leaking
+            // one owned Mat per cache hit. On the alias path we own nothing, so skip.
+            if (ownsImg) img.Dispose();
+            return cached;
+        }
 
         var res = MatchNoCache(img, tmp, matchingType, memberName);
-        pool.RegisterResult(img, tmp.Size, res);
+        // Ownership of img transfers to the pool (becomes next frame's prevImg). On the
+        // alias path the pool clones instead, leaving the caller's Mat untouched.
+        pool.RegisterResult(img, tmp.Size, res, ownsImg);
 
         return res;
     }
@@ -64,13 +81,13 @@ public static class TemplateMatcher
         CvInvoke.VConcat(new VectorOfMat(tempGray, tempAlpha), temp);
         if (temp.Height > show.Height)
         {
-            var emptyMat = new Mat(temp.Rows - show.Rows, show.Cols, show.Depth, show.NumberOfChannels);
+            using var emptyMat = new Mat(temp.Rows - show.Rows, show.Cols, show.Depth, show.NumberOfChannels);
             emptyMat.SetTo(new MCvScalar(0));
             CvInvoke.VConcat(new VectorOfMat(emptyMat, show), show);
         }
         else if (temp.Height < show.Height)
         {
-            var emptyMat = new Mat(show.Rows - temp.Rows, temp.Cols, temp.Depth, temp.NumberOfChannels);
+            using var emptyMat = new Mat(show.Rows - temp.Rows, temp.Cols, temp.Depth, temp.NumberOfChannels);
             emptyMat.SetTo(new MCvScalar(0));
             CvInvoke.VConcat(new VectorOfMat(emptyMat, temp), temp);
         }
@@ -89,5 +106,6 @@ public static class TemplateMatcher
 
         CvInvoke.Imshow(memberName, show);
         CvInvoke.WaitKey(Environment.GetEnvironmentVariable("DebugImgWait") == "true" ? 0 : 1);
+        show.Dispose();
     }
 }

@@ -24,7 +24,7 @@ public class ContentTemplateMatcher(TemplateManager templateManager, Config conf
         roi.Limit(new Rectangle(Point.Empty, mat.Size));
         if (roi.IsEmpty || roi.Width < Template.Size.Width || roi.Height < Template.Size.Height) return false;
 
-        var frameCropped = new Mat(mat, roi);
+        using var frameCropped = new Mat(mat, roi);
         var result = TemplateMatcher.Match(frameCropped, Template, TemplateMatchCachePool.MatchUsage.ContentStartSign);
 
         if (frameIndex != -1)
