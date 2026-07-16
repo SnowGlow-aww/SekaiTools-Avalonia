@@ -237,7 +237,13 @@ public class SubtitleMaker(VideoInfo videoInfo, TemplateManager templateManager,
             }
             else
             {
-                if (set.Data.BodyTranslated.LineCount() == 3)
+                // 原文 3 行 → 译文块被定位到 Line3(最低锚点，见 GenerateNoneJitterDialogEvents 的 styleName)，
+                // 其下方已无空间；译文若带 \N 会再折一行、越界叠进日文块（用户反馈：得手动删 \N）。团队成品
+                // 规范里译文恒为单物理行、靠 1行/2行/3行 样式定位，因此 3 行原文的短译文(未走分隔/过长行分支)
+                // 必须塌成单行。判定主语必须是 BodyOriginal(含真实 \n)：旧代码用 BodyTranslated——它从 txt 载入、
+                // 存的是字面 \N 而非真实 \n，LineCount() 恒为 1、塌行从不触发（这正是「\N 不自动删」的回归根因）。
+                // 口径与下方 styleName 的 Split("\n").Length 完全一致：凡被定位到 Line3 的都塌行。
+                if (set.Data.BodyOriginal.Split("\n").Length == 3)
                     set.Data.SetTranslationContent(set.Data.BodyTranslated.TrimAll());
                 dialogEvents.AddRange(GenerateDialogEvent(set));
             }

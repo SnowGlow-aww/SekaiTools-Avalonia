@@ -93,6 +93,12 @@ public sealed partial class Suppressor : IDisposable
     private CancellationTokenSource? _cts;
     private int _frameCount;
     private double _fps;
+    // 从 ffmpeg 首部 "Duration:" 行解析一次：进度百分比一律按 out_time/总时长 计算(单调、被时长封顶)。
+    private double _durationSec;
+    // 从视频流 "N fps" 解析一次：仅当 EmguCV 拿不到帧数时，用 时长×帧率 兜底估算总帧数。
+    private double _sourceFps;
+    // EmguCV 帧数探测是否已尝试过（哪怕返回 0）——避免每条进度行重开 VideoCapture。
+    private bool _frameCountProbed;
     private bool _lastLogLineWasProgress;
     private int _disposed;
 
@@ -123,6 +129,9 @@ public sealed partial class Suppressor : IDisposable
 
         _frameCount = 0;
         _fps = 0;
+        _durationSec = 0;
+        _sourceFps = 0;
+        _frameCountProbed = false;
         _lastLogLineWasProgress = false;
         _cts = new CancellationTokenSource();
 
@@ -291,7 +300,9 @@ public sealed partial class Suppressor : IDisposable
                 }
                 else
                 {
-                    var total = GetFrameCount();
+                    // 完成时用 ResolveTotalFrames(与运行期同源)：EmguCV 探不到但时长×帧率能兜出总数的
+                    // 输入，末尾也能正确补一帧 100%，不会卡在 99.x。
+                    var total = ResolveTotalFrames();
                     if (total > 0)
                     {
                         _frameCount = total;
@@ -389,19 +400,40 @@ public sealed partial class Suppressor : IDisposable
     {
         if (_fProcess == null) return;
         var stderr = _fProcess.StandardError;
+        var sb = new StringBuilder(256);
 
         try
         {
-            string? line;
-            while (!token.IsCancellationRequested && (line = stderr.ReadLine()) != null)
+            // 逐字读、遇 \r 或 \n 立即切段。ffmpeg 的进度行用 \r 原地覆盖(末尾无 \n)，普通日志用 \n。
+            // 旧代码 StreamReader.ReadLine() 读到 \r 必须预读一字节判 \r\n——ffmpeg 初始化期(探测/建
+            // libass 字体缓存)stderr 长时间静默，这个预读会一直阻塞，导致运行中一条进度都吐不出来
+            // (UI 恒显 "帧 0/0 · 0%")，直到进程被 Kill 才把缓冲的最后一条进度冲出。逐字读消除此阻塞，
+            // 进度即时可见。
+            int ch;
+            while (!token.IsCancellationRequested && (ch = stderr.Read()) >= 0)
             {
-                AnalysisLog(line);
+                var c = (char)ch;
+                if (c == '\r' || c == '\n')
+                {
+                    if (sb.Length > 0)
+                    {
+                        AnalysisLog(sb.ToString());
+                        sb.Clear();
+                    }
+                }
+                else
+                {
+                    sb.Append(c);
+                }
             }
+
+            if (sb.Length > 0)
+                AnalysisLog(sb.ToString());
         }
         catch (Exception ex) when (
             ex is IOException or ObjectDisposedException or OperationCanceledException)
         {
-            // 进程被关闭时 ReadLine 会抛，吞。
+            // 进程被关闭时 Read 会抛，吞。
         }
     }
 
@@ -428,15 +460,15 @@ public sealed partial class Suppressor : IDisposable
 
     private void AnalysisLog(string log)
     {
-        if (FfmpegProgressPattern().IsMatch(log))
+        var progress = FfmpegProgressPattern().Match(log);
+        if (progress.Success)
         {
-            var match = FfmpegProgressPattern().Match(log);
             // ffmpeg 进度数字始终是 invariant 格式；用 InvariantCulture + TryParse 避免
             // 欧洲逗号区把 "fps=23.5" 解析错，且解析失败时不抛（FormatException 会逃出
             // RunLogReader 的窄 catch 导致挂死）——失败就当普通日志行处理、跳过本次进度更新。
-            if (!int.TryParse(match.Groups["FrameNumber"].Value, NumberStyles.Integer,
+            if (!int.TryParse(progress.Groups["FrameNumber"].Value, NumberStyles.Integer,
                     CultureInfo.InvariantCulture, out var frameNumber) ||
-                !double.TryParse(match.Groups["FramesPerSecond"].Value, NumberStyles.Float,
+                !double.TryParse(progress.Groups["FramesPerSecond"].Value, NumberStyles.Float,
                     CultureInfo.InvariantCulture, out var framesPerSecond))
             {
                 _callbacks.OnLogLine?.Invoke(log);
@@ -444,7 +476,6 @@ public sealed partial class Suppressor : IDisposable
                 return;
             }
 
-            _frameCount = frameNumber;
             _fps = framesPerSecond;
 
             // 进度行用 OnProgressLogLine 替换上一行，避免日志窗口被进度刷屏。
@@ -455,27 +486,92 @@ public sealed partial class Suppressor : IDisposable
 
             _lastLogLineWasProgress = true;
 
-            var total = GetFrameCount();
+            var total = ResolveTotalFrames();
+
+            // 百分比一律按 out_time / 总时长 计算：out_time 单调且被总时长封顶。ffmpeg 的 frame= 在进程被
+            // Kill(取消)时可能已冲到全片帧数(实测 time=1.34s 却 frame=42334)，直接拿它当分子会假报 100%。
+            // 因此优先用 time=，把上报帧数换算成 时间比例×总帧数，既真实又天然夹在 [0,total] 内。
+            int reported;
+            var timeMatch = FfmpegTimePattern().Match(log);
+            if (_durationSec > 0 && total > 0 && timeMatch.Success &&
+                TryParseFfmpegTime(timeMatch.Groups["Time"].Value, out var outTimeSec))
+            {
+                var ratio = Math.Clamp(outTimeSec / _durationSec, 0, 1);
+                reported = (int)Math.Round(ratio * total);
+            }
+            else
+            {
+                // 兜底(总时长/时间未解析到)：退回 ffmpeg 帧数，仍夹在 [0,total] 防越界显示。
+                reported = total > 0 ? Math.Min(frameNumber, total) : frameNumber;
+            }
+
+            _frameCount = reported;
             if (total > 0)
-                _callbacks.OnProgress?.Invoke(_frameCount, total, _fps);
+                _callbacks.OnProgress?.Invoke(reported, total, _fps);
+
+            return;
         }
-        else
+
+        // 非进度行：普通日志。顺带一次性抓取总时长 / 源帧率，供上面的百分比与兜底总帧数使用。
+        if (_durationSec <= 0)
         {
-            _callbacks.OnLogLine?.Invoke(log);
-            _lastLogLineWasProgress = false;
+            var dur = FfmpegDurationPattern().Match(log);
+            if (dur.Success &&
+                int.TryParse(dur.Groups["H"].Value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var h) &&
+                int.TryParse(dur.Groups["M"].Value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var m) &&
+                double.TryParse(dur.Groups["S"].Value, NumberStyles.Float, CultureInfo.InvariantCulture, out var s))
+                _durationSec = h * 3600 + m * 60 + s;
         }
+
+        if (_sourceFps <= 0)
+        {
+            var vfps = FfmpegVideoFpsPattern().Match(log);
+            if (vfps.Success &&
+                double.TryParse(vfps.Groups["Fps"].Value, NumberStyles.Float, CultureInfo.InvariantCulture, out var f))
+                _sourceFps = f;
+        }
+
+        _callbacks.OnLogLine?.Invoke(log);
+        _lastLogLineWasProgress = false;
+    }
+
+    /// <summary>总帧数(百分比分母)：优先 EmguCV 探测(一次性缓存)，拿不到时用 时长×源帧率 兜底。</summary>
+    private int ResolveTotalFrames()
+    {
+        var probed = GetFrameCount();
+        if (probed > 0) return probed;
+        if (_durationSec > 0 && _sourceFps > 0) return (int)Math.Round(_durationSec * _sourceFps);
+        return 0;
+    }
+
+    /// <summary>解析 ffmpeg 的 HH:MM:SS(.ms) 时间为秒。失败返回 false（调用方自行走兜底）。</summary>
+    private static bool TryParseFfmpegTime(string value, out double seconds)
+    {
+        seconds = 0;
+        var parts = value.Split(':');
+        if (parts.Length != 3) return false;
+        if (!int.TryParse(parts[0], NumberStyles.Integer, CultureInfo.InvariantCulture, out var h)) return false;
+        if (!int.TryParse(parts[1], NumberStyles.Integer, CultureInfo.InvariantCulture, out var m)) return false;
+        if (!double.TryParse(parts[2], NumberStyles.Float, CultureInfo.InvariantCulture, out var s)) return false;
+        seconds = h * 3600 + m * 60 + s;
+        return true;
     }
 
     private int GetFrameCount()
     {
         if (_options.SourceFrameCount > 0) return _options.SourceFrameCount;
+        // 探测拿不到帧数(不支持的编码/探测失败会返回 0)时也只探一次：否则每条进度行都会
+        // 重开一个 VideoCapture 解码器(一秒数次)白吃资源。探不到就交给 ResolveTotalFrames 用
+        // 时长×源帧率 兜底。
+        if (_frameCountProbed) return 0;
+        _frameCountProbed = true;
         if (string.IsNullOrEmpty(_options.SourceVideo) || !File.Exists(_options.SourceVideo))
             return 0;
 
         using var capture = new VideoCapture(_options.SourceVideo);
         var probed = (int)capture.Get(CapProp.FrameCount);
-        _options.SourceFrameCount = probed;
-        return probed;
+        if (probed > 0) _options.SourceFrameCount = probed;
+        return probed > 0 ? probed : 0;
     }
 
     private Process CreateVapourProcess(string vapourExecutable, string vapourScript)
@@ -934,4 +1030,16 @@ public sealed partial class Suppressor : IDisposable
 
     [GeneratedRegex(@"^frame=\s{0,}(?<FrameNumber>\d*)\s+fps=\s{0,}(?<FramesPerSecond>[\d\.]+)")]
     private static partial Regex FfmpegProgressPattern();
+
+    // 进度行里的 out_time：time=HH:MM:SS(.ms)。用于按时间比例算真实百分比。
+    [GeneratedRegex(@"\btime=\s*(?<Time>\d+:\d+:\d+(?:\.\d+)?)")]
+    private static partial Regex FfmpegTimePattern();
+
+    // 首部 "Duration: HH:MM:SS.ms, ..." —— 总时长(百分比分母的时间基准)。
+    [GeneratedRegex(@"Duration:\s*(?<H>\d+):(?<M>\d+):(?<S>\d+(?:\.\d+)?)")]
+    private static partial Regex FfmpegDurationPattern();
+
+    // 视频流行里的 "..., 60 fps, ..." —— 源帧率(EmguCV 拿不到帧数时的兜底)。
+    [GeneratedRegex(@",\s*(?<Fps>\d+(?:\.\d+)?)\s+fps\b")]
+    private static partial Regex FfmpegVideoFpsPattern();
 }

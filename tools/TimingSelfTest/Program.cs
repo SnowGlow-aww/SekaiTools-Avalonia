@@ -111,6 +111,7 @@ internal static class Program
     static int Main(string[] args)
     {
         var mode = args.Length > 0 ? args[0] : "all";
+        if (mode == "real") return RunReal(args); // real 模式不用合成，直接跑真实素材
         Prepare();
         switch (mode)
         {
@@ -123,6 +124,61 @@ internal static class Program
                 WriteScriptAndTrans();
                 return RunAB();
         }
+    }
+
+    // 拿真实视频 + 剧情 json + 翻译 txt 跑一次完整打轴，打印每条对话的说话人/起止(秒)/正文，并导出 ass。
+    // 用于验证「短第 1 行折行导致时长过短」的修复(第 72 句 うんっ☆)与「3 行原文塌 \N」的修复。
+    static int RunReal(string[] args)
+    {
+        if (args.Length < 4)
+        {
+            Console.WriteLine("usage: real <video> <script.json> <translate.txt>");
+            return 2;
+        }
+
+        var video = args[1];
+        var script = args[2];
+        var trans = args[3];
+
+        double fps;
+        using (var cap = new VideoCapture(video)) fps = cap.Get(CapProp.Fps);
+        if (fps <= 0) fps = 60;
+        string Sec(int frameIndex) => TimeSpan.FromSeconds(frameIndex / fps).ToString(@"hh\:mm\:ss\.ff");
+
+        TemplateMatchCachePool.ResetAll();
+        var config = new Config(video, script, trans);
+        var collected = new List<DialogBaseFrameSet>();
+        var done = new ManualResetEventSlim(false);
+        var callbacks = new VideoProcessCallbacks
+        {
+            OnNewDialog = d =>
+            {
+                int idx;
+                lock (collected) { collected.Add(d); idx = collected.Count - 1; }
+                var body = d.Data.BodyOriginal.Replace("\r", "").Replace("\n", "\\n");
+                var dur = (d.EndIndex() - d.StartIndex()) / fps;
+                Console.WriteLine(
+                    $"[dlg {idx,3}] {d.Data.CharacterOriginal,-8} {Sec(d.StartIndex())}->{Sec(d.EndIndex())} ({dur,6:F2}s) {body}");
+            },
+            OnTaskFinished = () => done.Set(),
+        };
+
+        using var proc = new VideoProcessor(config, callbacks);
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        proc.StartProcess();
+        if (!done.Wait(TimeSpan.FromSeconds(2400)))
+            Console.WriteLine("[real] TIMEOUT waiting for OnTaskFinished");
+        sw.Stop();
+        Console.WriteLine($"[real] collected={collected.Count} elapsed={sw.Elapsed} stopReason={proc.StopReason} fps={fps}");
+
+        var subtitle = proc.GenerateSubtitle(
+            new List<BannerBaseFrameSet>(), collected, new List<MarkerBaseFrameSet>());
+        var ass = subtitle.ToString();
+        Directory.CreateDirectory(ScratchDir);
+        var outAss = Path.Combine(ScratchDir, "real_" + Path.GetFileNameWithoutExtension(video) + ".ass");
+        File.WriteAllText(outAss, ass);
+        Console.WriteLine($"[real] ass -> {outAss} ({ass.Length} chars)");
+        return 0;
     }
 
     // ---------- geometry helpers (mirror DialogTemplateMatcher) ----------

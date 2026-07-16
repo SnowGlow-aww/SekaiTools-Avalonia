@@ -208,6 +208,11 @@ public class DialogTemplateMatcher(
 
         // 2) 内容前缀(前 ≤6 个字)——区分同名说话人的不同台词。与主匹配一致用 6 字指纹，
         //    避免 3 字在共享前缀(『……/『私 等)的相邻台词间串扰，导致跳过探测落到错的那条。
+        //    ⚠ 这里**故意不**像 GetDialogInd 那样裁到第一视觉行：ProbeDialog 探测的是「下一条是否已出现」，
+        //    保留完整 6 字(可跨行内 `\n`)才有足够区分度——把它裁短会让「后一条短首行 + 与前一条共享前缀
+        //    (同说话人)」时，后条的短指纹误命中前条画面残留的同前缀内容，从而把还在显示的前条腰斩(正是
+        //    6c3ebf5 要消灭的滞后串扰)。短首行的下一条即便探不到(6 字跨行对不齐其折行画面)，也会由掉帧
+        //    宽限的正常收尾兜住，不会误伤。当前条自身能否到 Matched3 由 GetDialogInd(裁首行)保证，与此无关。
         var body = dialogBase.Data.BodyOriginal;
         if (string.IsNullOrEmpty(body)) return true; // 无正文则只认名牌
         var prefix = body[..Math.Min(6, body.Length)];
@@ -283,6 +288,21 @@ public class DialogTemplateMatcher(
             trimmed = trimmed[..trimmed.IndexOf('・')];
 
         return trimmed;
+    }
+
+    // 内容指纹只取**第一视觉行**(不跨行内 `\n`)。内容模板由 CreateImageWithText 渲染成**单行水平字条**，
+    // 若指纹跨过 `\n`(短第 1 行 + 长第 2 行时，前 6 字窗口会越到第 2 行)，字条里 `\n` 之后的字排在同一行右侧，
+    // 与画面折行后"该字已落到第 2 行"的实际布局对不齐 → 6 字指纹(template3)永不命中 → 该行卡死 Matched2 →
+    // 落入防滞后提前定版分支被下一条一命中就腰斩(实测 `うんっ☆\nでは…` 只被打 1.7s)。取第一行后指纹与画面
+    // 第 1 行对齐：第 1 行 ≥6 字的句子 firstLine[..6]==content[..6] 逐位不变；短第 1 行退化为其自身长度的指纹
+    // (如 `うんっ☆`=4字，可正常命中 → 走正常掉帧宽限定版，时长恢复)。
+    private static string FirstVisualLine(string content)
+    {
+        var nl = content.IndexOf('\n');
+        var line = nl <= 0 ? content : content[..nl];
+        // 剥掉 CRLF 的尾随 `\r`：否则单行字条会多一个 `\r` 幽灵格、对不齐画面，短首行重演卡死 Matched2。
+        // 正文无 `\r` 时(常态)此行不改变结果，保持逐位一致。
+        return line.Length > 0 && line[^1] == '\r' ? line[..^1] : line;
     }
 
     private MatchStatus DialogMatchContent(Mat img, DialogBaseFrameSet dialogBase, Point point,
@@ -392,9 +412,12 @@ public class DialogTemplateMatcher(
             // 0.84 误中 103『私の；6 字时仅 103 自身以 0.92 命中，串扰消失）。6 字前缀配合下方加宽的
             // 内容 ROI，可在同说话人快速对话里干净地区分相邻台词。打字机逐字动画下，1/3/6 字模板分别在
             // 打出第 1/3/6 个字时依次命中，与原三段式进度自然对应。
-            var dialogBody1 = content[..1];
-            var dialogBody2 = content[..Math.Min(3, content.Length)];
-            var dialogBody3 = content[..Math.Min(6, content.Length)];
+            // 指纹只取**第一视觉行**(见 FirstVisualLine)：短第 1 行 + 长第 2 行时，前 6 字会跨过行内 `\n`
+            // 落到画面第 2 行，而模板是单行字条 → template3 永不命中、卡死 Matched2 被提前定版腰斩。
+            var firstLine = FirstVisualLine(content);
+            var dialogBody1 = firstLine[..1];
+            var dialogBody2 = firstLine[..Math.Min(3, firstLine.Length)];
+            var dialogBody3 = firstLine[..Math.Min(6, firstLine.Length)];
             return
             [
                 templateManager.GetGaTemplate(TemplateUsage.DialogContent, dialogBody1),
