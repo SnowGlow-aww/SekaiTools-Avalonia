@@ -55,14 +55,14 @@ public sealed class SuppressHandler
             _stopRequested = false;
             _progressFrames = 0;
             _suppressor?.Dispose();
-            _suppressor = new Suppressor(options, MakeCallbacks(options, isRetry: false));
+            _suppressor = new Suppressor(options, MakeCallbacks(options, attempt: 0));
             _suppressor.Start();
         }
 
         return Task.FromResult<object?>("ok");
     }
 
-    private SuppressorCallbacks MakeCallbacks(SuppressorOptions options, bool isRetry)
+    private SuppressorCallbacks MakeCallbacks(SuppressorOptions options, int attempt)
     {
         return new SuppressorCallbacks
         {
@@ -76,16 +76,11 @@ public sealed class SuppressHandler
             },
             OnFinished = (reason, ex) =>
             {
-                // 硬件编码器"起步即失败"（一帧都没编出来）：典型于并行压制打满显卡
-                // 编码会话（AMF 并发 InitDX11 → AVERROR(ENODEV)=-19、NVENC 消费级卡
-                // 会话上限 → ENOMEM=-12）或驱动暂时性故障。自动改用 x264 软编 +
-                // 关硬解重试一次——宁可慢，不能让任务白白挂掉。已出过帧的失败不重试
-                // （问题不在初始化），软编失败也不重试（重跑同样的东西没有意义）。
-                if (!isRetry
-                    && reason == SuppressorStopReason.Failed
+                // "起步即失败"（一帧都没编出来）的自动降级阶梯，见 TryStartFallback。
+                // 已出过帧的失败不重试（问题不在起步），用户主动取消也不重试。
+                if (reason == SuppressorStopReason.Failed
                     && Volatile.Read(ref _progressFrames) == 0
-                    && IsHardwareEncoder(options.PreferredEncoder)
-                    && TryStartSoftwareRetry(options, ex))
+                    && TryStartFallback(options, ex, attempt))
                     return;
 
                 _transport.SendNotification("suppress.finished",
@@ -94,46 +89,78 @@ public sealed class SuppressHandler
         };
     }
 
-    private bool TryStartSoftwareRetry(SuppressorOptions failed, Exception? ex)
+    /// <summary>
+    /// 起步失败降级阶梯（至多两级重试）：
+    /// ① 疑似管线挂起（看门狗强杀）且硬解开着 → 只关硬解、编码器不变。真机实证
+    ///    （Windows+QSV 报告者）：EmguCV 探帧与 dxva2 硬件解码全挂死、QSV 试编码
+    ///    却通过的机器——解码栈坏了但编码是好的，保住硬编速度；
+    /// ② 其余起步失败（硬编报错退出：并行压制打满显卡编码会话 AMF→-19 / NVENC→-12、
+    ///    驱动暂时性故障；或关硬解后仍挂起）→ x264 软编 + 软件解码，宁可慢不白挂。
+    /// 已是全软还失败 → 不再重试（重跑同样的东西没有意义）。
+    /// </summary>
+    private bool TryStartFallback(SuppressorOptions failed, Exception? ex, int attempt)
     {
-        var fallback = new SuppressorOptions
+        if (attempt >= 2) return false;
+
+        var hang = ex is SuppressPipelineHangException;
+        SuppressorOptions fallback;
+        string logLine;
+
+        if (hang && failed.UseHwAccelDecode)
         {
-            SourceVideo = failed.SourceVideo,
-            SourceSubtitle = failed.SourceSubtitle,
-            OutputPath = failed.OutputPath,
-            UseComplexConfig = failed.UseComplexConfig,
-            Crf = failed.Crf,
-            FfmpegPath = failed.FfmpegPath,
-            PreferredEncoder = VideoEncoder.Libx264,
-            UseHwAccelDecode = false,
-            PreferFfmpegPipeline = failed.PreferFfmpegPipeline,
-            SourceFrameCount = failed.SourceFrameCount,
-        };
+            fallback = CloneOptions(failed, failed.PreferredEncoder, useHwAccelDecode: false);
+            logLine = "[Sekai] 疑似硬件解码挂起（起步零输出）——自动关闭硬解重试，" +
+                      $"编码器保持 {failed.PreferredEncoder}。若每次压制都触发此重试，" +
+                      "可在压制选项里直接关闭「硬解」跳过等待。";
+        }
+        else if (IsHardwareEncoder(failed.PreferredEncoder))
+        {
+            fallback = CloneOptions(failed, VideoEncoder.Libx264, useHwAccelDecode: false);
+            logLine = hang
+                ? "[Sekai] 管线仍挂起（起步零输出）——自动改用 x264 软编 + 软件解码重试。"
+                : $"[Sekai] 硬件编码器 {failed.PreferredEncoder} 启动即失败" +
+                  $"（{ex?.Message?.ReplaceLineEndings(" ") ?? "未知原因"}）——" +
+                  "常见于并行压制占满显卡编码会话；自动改用 x264 软编重试。";
+        }
+        else
+        {
+            return false;
+        }
 
         lock (_gate)
         {
             if (_stopRequested) return false;
-            _transport.SendNotification("suppress.log", new
-            {
-                line = $"[Sekai] 硬件编码器 {failed.PreferredEncoder} 启动即失败" +
-                       $"（{ex?.Message?.ReplaceLineEndings(" ") ?? "未知原因"}）——" +
-                       "常见于并行压制占满显卡编码会话；自动改用 x264 软编重试。",
-            });
+            _transport.SendNotification("suppress.log", new { line = logLine });
             try
             {
                 _suppressor?.Dispose();
-                _suppressor = new Suppressor(fallback, MakeCallbacks(fallback, isRetry: true));
+                _suppressor = new Suppressor(fallback, MakeCallbacks(fallback, attempt + 1));
                 _suppressor.Start();
                 return true;
             }
             catch (Exception startEx)
             {
                 _transport.SendNotification("suppress.log",
-                    new { line = "[Sekai] x264 软编重试启动失败：" + startEx.Message });
+                    new { line = "[Sekai] 降级重试启动失败：" + startEx.Message });
                 return false;
             }
         }
     }
+
+    private static SuppressorOptions CloneOptions(SuppressorOptions src, VideoEncoder encoder, bool useHwAccelDecode)
+        => new()
+        {
+            SourceVideo = src.SourceVideo,
+            SourceSubtitle = src.SourceSubtitle,
+            OutputPath = src.OutputPath,
+            UseComplexConfig = src.UseComplexConfig,
+            Crf = src.Crf,
+            FfmpegPath = src.FfmpegPath,
+            PreferredEncoder = encoder,
+            UseHwAccelDecode = useHwAccelDecode,
+            PreferFfmpegPipeline = src.PreferFfmpegPipeline,
+            SourceFrameCount = src.SourceFrameCount,
+        };
 
     private static bool IsHardwareEncoder(VideoEncoder encoder)
         => encoder is not (VideoEncoder.Libx264 or VideoEncoder.Libx265 or VideoEncoder.LibSvtAv1);

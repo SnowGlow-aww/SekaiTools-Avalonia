@@ -73,6 +73,12 @@ public enum SuppressorStopReason
 }
 
 /// <summary>
+/// 管线挂起被看门狗强制终止（起步长时间零输出）。区别于普通报错退出：
+/// 上层（SuppressHandler）据此优先走"关硬解、编码器不变"的重试，而非直接降 x264。
+/// </summary>
+public sealed class SuppressPipelineHangException(string message) : Exception(message);
+
+/// <summary>
 /// 视频压制流水线。
 ///
 /// 优先使用本地 VapourSynth 资源（如果存在），否则自动回退到跨平台的 ffmpeg
@@ -113,6 +119,8 @@ public sealed partial class Suppressor : IDisposable
     private double _pgOutTimeSec = -1;
     // stderr 是否出现过 stats 进度行：出现过则机读 tick 不再合成日志行，免得两路进度行交替刷屏。
     private volatile bool _sawStderrProgress;
+    // 看门狗判定管线挂起并强杀了子进程：收尾时以 SuppressPipelineHangException 收场。
+    private volatile bool _hangAborted;
     private int _disposed;
 
     public Suppressor(SuppressorOptions options, SuppressorCallbacks callbacks)
@@ -151,6 +159,7 @@ public sealed partial class Suppressor : IDisposable
         _pgFps = 0;
         _pgOutTimeSec = -1;
         _sawStderrProgress = false;
+        _hangAborted = false;
         _cts = new CancellationTokenSource();
         StartFrameProbe();
 
@@ -336,6 +345,12 @@ public sealed partial class Suppressor : IDisposable
             if (!canceled)
             {
                 failure = BuildExitFailure();
+                // 看门狗强杀的挂起：退出码信息（Kill 产生的 -1/137）没有诊断价值，
+                // 换成带类型标记的挂起异常，上层据此选降级路线。
+                if (_hangAborted)
+                    failure = new SuppressPipelineHangException(
+                        "压制管线挂起：启动后长时间无任何进度输出，已被看门狗终止" +
+                        (failure != null ? $"（{failure.Message.ReplaceLineEndings(" ")}）" : "。"));
                 if (failure != null)
                 {
                     _callbacks.OnLogLine?.Invoke($"[Sekai] 压制后端异常退出：{failure.Message}");
@@ -723,8 +738,12 @@ public sealed partial class Suppressor : IDisposable
         thread.Start();
     }
 
-    /// <summary>启动 12 秒后两路进度(stderr stats / -progress 机读)都毫无动静时写一行诊断日志。
-    /// 真机故障排查全靠用户导出的日志，这一行能直接区分"通道没数据"和"处理链路死了"。</summary>
+    /// <summary>两路进度(stderr stats / -progress 机读)持续毫无动静时的两级看门狗：
+    /// 12 秒先写一行诊断日志；到挂起阈值（默认 25 秒，SEKAI_SUPPRESS_HANG_ABORT_SECONDS
+    /// 可调，&lt;=0 关闭强杀只留诊断）仍零输出则判定管线挂起——真机实证（Windows+QSV
+    /// 报告者，2.3.5）：坏掉的硬件解码栈会让 ffmpeg 卡在首帧，无报错无输出永不退出，
+    /// 唯一出路是强杀子进程、以 SuppressPipelineHangException 收场让上层降级重试。
+    /// 出现过任何一行进度输出后永不触发（中途变慢/磁盘等待不属于起步挂起）。</summary>
     private void StartProgressWatchdog()
     {
         var token = _cts!.Token;
@@ -732,10 +751,29 @@ public sealed partial class Suppressor : IDisposable
         {
             try
             {
-                await Task.Delay(TimeSpan.FromSeconds(12), token).ConfigureAwait(false);
-                if (_sawStderrProgress || Volatile.Read(ref _pgLineCount) > 0 || !IsRunning) return;
+                var abortSeconds = 25;
+                var env = Environment.GetEnvironmentVariable("SEKAI_SUPPRESS_HANG_ABORT_SECONDS");
+                if (!string.IsNullOrEmpty(env) && int.TryParse(env, out var custom)) abortSeconds = custom;
+
+                var diagSeconds = abortSeconds <= 0 ? 12 : Math.Min(12, abortSeconds);
+                await Task.Delay(TimeSpan.FromSeconds(diagSeconds), token).ConfigureAwait(false);
+                if (HasProgressOutput() || !IsRunning) return;
+                if (diagSeconds >= 12)
+                    _callbacks.OnLogLine?.Invoke(
+                        "[Sekai] 诊断：启动 12 秒未收到任何进度输出（stderr 状态行与 -progress 机读通道均无）——请导出此日志反馈。");
+
+                if (abortSeconds <= 0) return;
+                if (abortSeconds > diagSeconds)
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(abortSeconds - diagSeconds), token).ConfigureAwait(false);
+                    if (HasProgressOutput() || !IsRunning) return;
+                }
+
+                _hangAborted = true;
                 _callbacks.OnLogLine?.Invoke(
-                    "[Sekai] 诊断：启动 12 秒未收到任何进度输出（stderr 状态行与 -progress 机读通道均无）——请导出此日志反馈。");
+                    $"[Sekai] 启动 {abortSeconds} 秒无任何进度输出：疑似解码/编码管线挂起，已自动终止压制进程。");
+                TryKill(_vProcess);
+                TryKill(_fProcess);
             }
             catch
             {
@@ -743,6 +781,9 @@ public sealed partial class Suppressor : IDisposable
             }
         });
     }
+
+    private bool HasProgressOutput()
+        => _sawStderrProgress || Volatile.Read(ref _pgLineCount) > 0;
 
     /// <summary>解析 ffmpeg 的 HH:MM:SS(.ms) 时间为秒。失败返回 false（调用方自行走兜底）。</summary>
     private static bool TryParseFfmpegTime(string value, out double seconds)
