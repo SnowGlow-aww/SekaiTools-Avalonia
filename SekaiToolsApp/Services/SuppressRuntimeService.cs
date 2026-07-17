@@ -27,6 +27,16 @@ public sealed record SuppressRuntimeProbe(
     string Message,
     SuppressRuntimeDescriptor? Descriptor = null);
 
+/// <summary>试编码探测的完整结果：可用列表 + 每个未通过的硬件编码器的失败原因
+/// （key=VideoEncoder 名，value=原因摘要）。此前只回列表，NVENC 之类
+/// "该在却不在"的情况完全是黑盒。</summary>
+public sealed record EncoderProbeResult(
+    List<VideoEncoder> Available,
+    IReadOnlyDictionary<string, string> Failures);
+
+/// <summary>字体子系统体检结果。Status: ok / slow / hung / skipped。</summary>
+public sealed record FontSubsystemCheck(string Status, int ElapsedMs, string Message);
+
 public static class SuppressRuntimeService
 {
     private static readonly string[] FfmpegExecutableNames =
@@ -91,21 +101,26 @@ public static class SuppressRuntimeService
         ["libsvtav1"] = VideoEncoder.LibSvtAv1,
     };
 
-    private static readonly ConcurrentDictionary<string, Task<List<VideoEncoder>>> EncoderProbeCache = new();
+    private static readonly ConcurrentDictionary<string, Task<EncoderProbeResult>> EncoderProbeCache = new();
 
-    public static Task<List<VideoEncoder>> ProbeAvailableEncodersAsync(string? ffmpegPathHint = null)
+    public static async Task<List<VideoEncoder>> ProbeAvailableEncodersAsync(string? ffmpegPathHint = null)
+        => (await ProbeEncodersDetailedAsync(ffmpegPathHint)).Available;
+
+    public static Task<EncoderProbeResult> ProbeEncodersDetailedAsync(string? ffmpegPathHint = null)
     {
         if (!TryResolveFfmpeg(ffmpegPathHint, out var ffmpegPath, out _))
-            return Task.FromResult(new List<VideoEncoder> { VideoEncoder.Libx264 });
+            return Task.FromResult(new EncoderProbeResult(
+                [VideoEncoder.Libx264], new Dictionary<string, string>()));
 
         // GetOrAdd 的 valueFactory 可能并发跑两次，但探测幂等、只是浪费几秒，无需加锁。
         return EncoderProbeCache.GetOrAdd(ffmpegPath, ProbeEncodersUncachedAsync);
     }
 
-    private static async Task<List<VideoEncoder>> ProbeEncodersUncachedAsync(string ffmpegPath)
+    private static async Task<EncoderProbeResult> ProbeEncodersUncachedAsync(string ffmpegPath)
     {
         // x264 是所有构建的保底编码器，永远在列。
         var available = new List<VideoEncoder> { VideoEncoder.Libx264 };
+        var failures = new ConcurrentDictionary<string, string>();
 
         string output;
         try
@@ -121,7 +136,7 @@ public static class SuppressRuntimeService
             psi.ArgumentList.Add("-encoders");
 
             using var proc = Process.Start(psi);
-            if (proc == null) return available;
+            if (proc == null) return new EncoderProbeResult(available, failures);
 
             var stderrDrain = proc.StandardError.ReadToEndAsync();
             output = await proc.StandardOutput.ReadToEndAsync();
@@ -130,7 +145,7 @@ public static class SuppressRuntimeService
         }
         catch
         {
-            return available; // probe 失败不阻塞，保底 x264
+            return new EncoderProbeResult(available, failures); // probe 失败不阻塞，保底 x264
         }
 
         foreach (var (name, encoder) in SoftwareEncoderMap)
@@ -157,8 +172,11 @@ public static class SuppressRuntimeService
                 var ok = new List<VideoEncoder>();
                 foreach (var (name, encoder) in group)
                 {
-                    if (await VerifyEncoderAsync(ffmpegPath, name))
+                    var (success, reason) = await VerifyEncoderAsync(ffmpegPath, name);
+                    if (success)
                         ok.Add(encoder);
+                    else
+                        failures[encoder.ToString()] = reason;
                 }
 
                 return ok;
@@ -167,7 +185,7 @@ public static class SuppressRuntimeService
         foreach (var check in groupChecks)
             available.AddRange(await check);
 
-        return available;
+        return new EncoderProbeResult(available, failures);
     }
 
     /// <summary>ffmpeg 硬件编码器命名恒为 codec_vendor（如 hevc_nvenc），取家族名分组。</summary>
@@ -177,8 +195,9 @@ public static class SuppressRuntimeService
         return idx >= 0 ? encoderName[(idx + 1)..] : encoderName;
     }
 
-    /// <summary>用几帧黑场真实跑一遍编码器，验证对应硬件/驱动确实存在且能初始化。</summary>
-    private static async Task<bool> VerifyEncoderAsync(string ffmpegPath, string encoderName)
+    /// <summary>用几帧黑场真实跑一遍编码器，验证对应硬件/驱动确实存在且能初始化。
+    /// 失败时带回原因摘要（最后一行 stderr / 超时 / 异常），供探测结果与日志展示。</summary>
+    private static async Task<(bool Ok, string Reason)> VerifyEncoderAsync(string ffmpegPath, string encoderName)
     {
         Process? proc = null;
         try
@@ -208,36 +227,178 @@ public static class SuppressRuntimeService
             psi.ArgumentList.Add("-");
 
             proc = Process.Start(psi);
-            if (proc == null) return false;
+            if (proc == null) return (false, "无法启动 ffmpeg 试编码进程");
 
-            var drain = Task.WhenAll(
-                proc.StandardOutput.ReadToEndAsync(),
-                proc.StandardError.ReadToEndAsync());
+            var stdoutDrain = proc.StandardOutput.ReadToEndAsync();
+            var stderrDrain = proc.StandardError.ReadToEndAsync();
 
             // 坏驱动可能在初始化里挂死——超时按不可用处理并回收进程。
             using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(20));
             await proc.WaitForExitAsync(cts.Token);
-            await drain;
-            return proc.ExitCode == 0;
-        }
-        catch
-        {
-            try
-            {
-                if (proc is { HasExited: false }) proc.Kill(entireProcessTree: true);
-            }
-            catch
-            {
-                // 已退出/句柄失效，忽略。
-            }
+            await Task.WhenAll(stdoutDrain, stderrDrain);
+            if (proc.ExitCode == 0) return (true, "");
 
-            return false;
+            // -loglevel error 下 stderr 基本只剩真正的错误，取最后一行非空即病灶。
+            var lastError = stderrDrain.Result
+                .Split('\n', StringSplitOptions.RemoveEmptyEntries)
+                .Select(l => l.Trim())
+                .LastOrDefault(l => l.Length > 0) ?? "";
+            if (lastError.Length > 200) lastError = lastError[..200];
+            return (false, $"退出码 {proc.ExitCode}" + (lastError.Length > 0 ? "：" + lastError : ""));
+        }
+        catch (OperationCanceledException)
+        {
+            KillQuiet(proc);
+            return (false, "试编码 20 秒未完成（已终止）——疑似驱动初始化挂起");
+        }
+        catch (Exception ex)
+        {
+            KillQuiet(proc);
+            return (false, "试编码异常：" + ex.Message);
         }
         finally
         {
             proc?.Dispose();
         }
     }
+
+    private static void KillQuiet(Process? proc)
+    {
+        try
+        {
+            if (proc is { HasExited: false }) proc.Kill(entireProcessTree: true);
+        }
+        catch
+        {
+            // 已退出/句柄失效，忽略。
+        }
+    }
+
+    private static readonly ConcurrentDictionary<string, Task<FontSubsystemCheck>> FontCheckCache = new();
+
+    /// <summary>字体子系统体检：lavfi 黑帧两帧 + 内置字体/系统字体各一行字幕的迷你压制。
+    /// libass 在 Windows 上靠 DirectWrite/GDI 枚举系统字体做匹配与缺字回退，字体缓存
+    /// 损坏的机器上单次字体查询能慢到数秒甚至无限挂起（真机实证：压制起步零输出、
+    /// 日志停在 fontselect 序列里，纯软编管线同样挂）——健康机器亚秒完成，病机在
+    /// 压制前就能暴露。结果按 ffmpeg 路径缓存（进程内一次）。
+    /// SEKAI_SUPPRESS_FONTCHECK_TIMEOUT_SECONDS 可调超时（默认 20）。</summary>
+    public static Task<FontSubsystemCheck> ProbeFontSubsystemAsync(string? ffmpegPathHint = null)
+    {
+        if (!TryResolveFfmpeg(ffmpegPathHint, out var ffmpegPath, out _))
+            return Task.FromResult(new FontSubsystemCheck("skipped", 0, "未找到 ffmpeg，跳过检测"));
+
+        return FontCheckCache.GetOrAdd(ffmpegPath, FontCheckUncachedAsync);
+    }
+
+    private static async Task<FontSubsystemCheck> FontCheckUncachedAsync(string ffmpegPath)
+    {
+        var timeoutSeconds = 20;
+        var env = Environment.GetEnvironmentVariable("SEKAI_SUPPRESS_FONTCHECK_TIMEOUT_SECONDS");
+        if (!string.IsNullOrEmpty(env) && int.TryParse(env, out var custom) && custom > 0)
+            timeoutSeconds = custom;
+
+        string assPath;
+        try
+        {
+            assPath = Path.Combine(Path.GetTempPath(), "sekai-fontcheck.ass");
+            File.WriteAllText(assPath, FontCheckAss);
+        }
+        catch (Exception ex)
+        {
+            return new FontSubsystemCheck("skipped", 0, "无法写入临时字幕文件，跳过检测：" + ex.Message);
+        }
+
+        var filter = $"subtitles=filename={Suppressor.EscapeFfmpegFilterValue(assPath)}";
+        var fontsDir = Suppressor.BundledFontsDir();
+        if (fontsDir is not null)
+            filter += $":fontsdir={Suppressor.EscapeFfmpegFilterValue(fontsDir)}";
+
+        Process? proc = null;
+        var stopwatch = Stopwatch.StartNew();
+        try
+        {
+            var psi = new ProcessStartInfo(ffmpegPath)
+            {
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+            };
+            psi.ArgumentList.Add("-hide_banner");
+            psi.ArgumentList.Add("-loglevel");
+            psi.ArgumentList.Add("error");
+            psi.ArgumentList.Add("-f");
+            psi.ArgumentList.Add("lavfi");
+            psi.ArgumentList.Add("-i");
+            psi.ArgumentList.Add("color=black:s=640x360:r=30:d=0.2");
+            psi.ArgumentList.Add("-frames:v");
+            psi.ArgumentList.Add("2");
+            psi.ArgumentList.Add("-vf");
+            psi.ArgumentList.Add(filter);
+            psi.ArgumentList.Add("-an");
+            psi.ArgumentList.Add("-f");
+            psi.ArgumentList.Add("null");
+            psi.ArgumentList.Add("-");
+
+            proc = Process.Start(psi);
+            if (proc == null)
+                return new FontSubsystemCheck("skipped", 0, "无法启动检测进程，跳过检测");
+
+            var drain = Task.WhenAll(
+                proc.StandardOutput.ReadToEndAsync(),
+                proc.StandardError.ReadToEndAsync());
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(timeoutSeconds));
+            await proc.WaitForExitAsync(cts.Token);
+            await drain;
+            stopwatch.Stop();
+
+            var elapsedMs = (int)stopwatch.ElapsedMilliseconds;
+            if (proc.ExitCode != 0)
+                return new FontSubsystemCheck("skipped", elapsedMs,
+                    $"检测未能完成（退出码 {proc.ExitCode}），不代表字体异常");
+            if (elapsedMs > 6000)
+                return new FontSubsystemCheck("slow", elapsedMs,
+                    $"异常缓慢（{elapsedMs / 1000.0:0.#} 秒）——本机字体子系统（Windows 字体缓存 / DirectWrite）" +
+                    "疑似异常，压制可能长时间无进度；建议重建系统字体缓存后重启，并检查最近安装的字体");
+            return new FontSubsystemCheck("ok", elapsedMs, $"正常（{elapsedMs} ms）");
+        }
+        catch (OperationCanceledException)
+        {
+            KillQuiet(proc);
+            return new FontSubsystemCheck("hung", (int)stopwatch.ElapsedMilliseconds,
+                $"检测 {timeoutSeconds} 秒未完成（已终止）——本机字体子系统（Windows 字体缓存 / DirectWrite）" +
+                "疑似损坏，压制的字幕渲染会挂起；建议重建系统字体缓存后重启，并检查 / 清理最近安装的字体");
+        }
+        catch (Exception ex)
+        {
+            KillQuiet(proc);
+            return new FontSubsystemCheck("skipped", (int)stopwatch.ElapsedMilliseconds,
+                "检测异常，跳过：" + ex.Message);
+        }
+        finally
+        {
+            proc?.Dispose();
+        }
+    }
+
+    // 两行字幕分别命中内置字体（走 fontsdir 内存字体）与系统字体（走 DirectWrite/
+    // fontconfig 系统枚举）——病灶在系统枚举侧，缺了第二行测不出来。
+    private const string FontCheckAss = """
+[Script Info]
+ScriptType: v4.00+
+PlayResX: 640
+PlayResY: 360
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Bundled,Source Han Sans CN Medium,40,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,0,2,10,10,10,1
+Style: System,Arial,40,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,0,8,10,10,10,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:00.00,0:00:00.20,Bundled,,0,0,0,,字体子系统检测 テスト
+Dialogue: 0,0:00:00.00,0:00:00.20,System,,0,0,0,,Font subsystem check 123
+""";
 
     /// <summary>
     /// 从可用列表里挑默认编码器：优先本平台的 HEVC 硬编（质量/体积比好、够快），

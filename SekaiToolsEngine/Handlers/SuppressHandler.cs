@@ -58,6 +58,21 @@ public sealed class SuppressHandler
         if (ffmpegDesc is not null)
             _transport.SendNotification("suppress.log", new { line = "[Sekai] " + ffmpegDesc });
 
+        // 字体子系统体检异步跑（进程内缓存，不阻塞启动）：健康机器亚秒出"正常"，
+        // 病机的"检测超时"会赶在挂起看门狗裁决前后落进任务日志——导出的日志自带病灶结论。
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                var fontCheck = await SuppressRuntimeService.ProbeFontSubsystemAsync(options.FfmpegPath);
+                _transport.SendNotification("suppress.log", new { line = "[Sekai] 字体子系统: " + fontCheck.Message });
+            }
+            catch
+            {
+                // 体检失败不影响压制。
+            }
+        });
+
         lock (_gate)
         {
             _stopRequested = false;
@@ -210,9 +225,12 @@ public sealed class SuppressHandler
 
         // 逐个试编码验证硬件真的在（结果按 ffmpeg 路径缓存，进程内只跑一次）；
         // recommended 按平台挑最优硬编，客户端用它当默认值——Windows 上再也不会
-        // 默认到 macOS 专属的 VideoToolbox。
-        var encoders = await SuppressRuntimeService.ProbeAvailableEncodersAsync(hint);
-        var recommended = SuppressRuntimeService.RecommendEncoder(encoders);
+        // 默认到 macOS 专属的 VideoToolbox。字体子系统体检与试编码并发跑（各自
+        // 20s 封顶），probe 总时长不因此变长。
+        var fontCheckTask = SuppressRuntimeService.ProbeFontSubsystemAsync(hint);
+        var encoderProbe = await SuppressRuntimeService.ProbeEncodersDetailedAsync(hint);
+        var recommended = SuppressRuntimeService.RecommendEncoder(encoderProbe.Available);
+        var fontCheck = await fontCheckTask;
 
         return new
         {
@@ -220,8 +238,12 @@ public sealed class SuppressHandler
             message = probe.Message,
             backend = probe.Descriptor?.Backend.ToString(),
             ffmpegPath = probe.Descriptor?.FfmpegPath,
-            encoders = encoders.Select(e => e.ToString()).ToArray(),
+            encoders = encoderProbe.Available.Select(e => e.ToString()).ToArray(),
             recommended = recommended.ToString(),
+            // 未通过试编码的硬件编码器 → 原因摘要（RTX 机器上 NVENC 消失这类
+            // "该在却不在"从黑盒变成一句话病因）。
+            encoderFailures = encoderProbe.Failures,
+            fontCheck = new { status = fontCheck.Status, elapsedMs = fontCheck.ElapsedMs, message = fontCheck.Message },
         };
     }
 }

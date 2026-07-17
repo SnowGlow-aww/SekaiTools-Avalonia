@@ -940,8 +940,8 @@ public sealed partial class Suppressor : IDisposable
         return filter;
     }
 
-    /// <summary>随应用/引擎发布的字幕字体目录（存在且非空才返回）。</summary>
-    private static string? BundledFontsDir()
+    /// <summary>随应用/引擎发布的字幕字体目录（存在且非空才返回）。字体体检复用。</summary>
+    internal static string? BundledFontsDir()
     {
         var baseDir = Path.GetDirectoryName(Environment.ProcessPath);
         if (string.IsNullOrEmpty(baseDir)) baseDir = AppContext.BaseDirectory;
@@ -969,7 +969,7 @@ public sealed partial class Suppressor : IDisposable
     /// 同时为两层做转义。各分支的字节数都已用打包同款 ffmpeg 实测过含
     /// 撇号 / 空格 / 方括号 / 逗号 / 分号 / 等号 / 中文 的路径。
     /// </summary>
-    private static string EscapeFfmpegFilterValue(string value)
+    internal static string EscapeFfmpegFilterValue(string value)
     {
         var normalized = value.Replace('\\', '/');
         var builder = new StringBuilder(normalized.Length * 2);
