@@ -40,6 +40,7 @@
 
     <ItemGroup>
         <Compile Include="..\SekaiToolsApp\Services\Suppressor.cs" Link="Shared\Suppressor.cs" />
+        <Compile Include="..\SekaiToolsApp\Services\SystemEnvironmentInfo.cs" Link="Shared\SystemEnvironmentInfo.cs" />
         <Compile Include="..\SekaiToolsApp\Services\SuppressRuntimeService.cs" Link="Shared\SuppressRuntimeService.cs" />
         <Compile Include="..\SekaiToolsApp\Services\X264Params.cs" Link="Shared\X264Params.cs" />
         <Compile Include="..\SekaiToolsApp\Services\EncoderConfig.cs" Link="Shared\EncoderConfig.cs" />

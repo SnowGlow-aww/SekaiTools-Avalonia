@@ -50,6 +50,14 @@ public sealed class SuppressHandler
             PreferFfmpegPipeline = true,
         };
 
+        // 环境概览进日志（引擎/系统/CPU/内存/显卡驱动/ffmpeg 版本）：真机故障排查
+        // 全靠导出的日志，这里一次给全。每个任务开头打一遍（降级重试不重复）。
+        foreach (var line in SystemEnvironmentInfo.DescribeLines())
+            _transport.SendNotification("suppress.log", new { line });
+        var ffmpegDesc = DescribeFfmpegSafe(options.FfmpegPath);
+        if (ffmpegDesc is not null)
+            _transport.SendNotification("suppress.log", new { line = "[Sekai] " + ffmpegDesc });
+
         lock (_gate)
         {
             _stopRequested = false;
@@ -164,6 +172,21 @@ public sealed class SuppressHandler
 
     private static bool IsHardwareEncoder(VideoEncoder encoder)
         => encoder is not (VideoEncoder.Libx264 or VideoEncoder.Libx265 or VideoEncoder.LibSvtAv1);
+
+    /// <summary>ffmpeg 版本行：优先用与压制一致的解析结果（探测缓存过，不重复开销），
+    /// 解析失败退回 hint 路径；再失败返回 null（概览缺一行不影响压制）。</summary>
+    private static string? DescribeFfmpegSafe(string? hint)
+    {
+        try
+        {
+            var resolved = Suppressor.ProbeRuntime(hint, preferFfmpeg: true).Descriptor?.FfmpegPath;
+            return SystemEnvironmentInfo.DescribeFfmpeg(resolved ?? hint);
+        }
+        catch
+        {
+            return SystemEnvironmentInfo.DescribeFfmpeg(hint);
+        }
+    }
 
     private async Task<object?> StopAsync(JsonElement? @params)
     {
