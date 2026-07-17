@@ -90,6 +90,7 @@ public sealed partial class Suppressor : IDisposable
     private Task? _pipeTask;
     private Task? _logTask;
     private Task? _vLogTask;
+    private Task? _progressTask;
     private CancellationTokenSource? _cts;
     private int _frameCount;
     private double _fps;
@@ -99,7 +100,14 @@ public sealed partial class Suppressor : IDisposable
     private double _sourceFps;
     // EmguCV 帧数探测是否已尝试过（哪怕返回 0）——避免每条进度行重开 VideoCapture。
     private bool _frameCountProbed;
+    private readonly object _probeGate = new();
     private bool _lastLogLineWasProgress;
+    // -progress pipe:1 机读进度块的累积值（stdout 读取线程独占写入，progress= 行收束上报）。
+    private int _pgFrame;
+    private double _pgFps;
+    private double _pgOutTimeSec = -1;
+    // stderr 是否出现过 stats 进度行：出现过则机读 tick 不再合成日志行，免得两路进度行交替刷屏。
+    private volatile bool _sawStderrProgress;
     private int _disposed;
 
     public Suppressor(SuppressorOptions options, SuppressorCallbacks callbacks)
@@ -133,6 +141,10 @@ public sealed partial class Suppressor : IDisposable
         _sourceFps = 0;
         _frameCountProbed = false;
         _lastLogLineWasProgress = false;
+        _pgFrame = 0;
+        _pgFps = 0;
+        _pgOutTimeSec = -1;
+        _sawStderrProgress = false;
         _cts = new CancellationTokenSource();
 
         switch (_runtime.Backend)
@@ -194,6 +206,15 @@ public sealed partial class Suppressor : IDisposable
         {
             // 同上。
         }
+
+        try
+        {
+            if (_progressTask != null) await _progressTask.ConfigureAwait(false);
+        }
+        catch
+        {
+            // 同上。
+        }
     }
 
     private void StartLegacyPipeline()
@@ -216,6 +237,7 @@ public sealed partial class Suppressor : IDisposable
         _pipeTask = Task.Run(() => RunPipe(_cts!.Token));
         _logTask = Task.Run(() => RunLogReader(_cts!.Token));
         _vLogTask = Task.Run(() => RunVapourLogReader(_cts!.Token));
+        _progressTask = Task.Run(() => RunProgressReader(_cts!.Token));
     }
 
     private void StartFfmpegPipeline()
@@ -229,6 +251,7 @@ public sealed partial class Suppressor : IDisposable
         BoostProcessPriority(_fProcess);
 
         _logTask = Task.Run(() => RunLogReader(_cts!.Token));
+        _progressTask = Task.Run(() => RunProgressReader(_cts!.Token));
     }
 
     private void LogCommandLine(Process process, string name)
@@ -287,6 +310,12 @@ public sealed partial class Suppressor : IDisposable
             if (_pipeTask != null)
             {
                 try { await _pipeTask.ConfigureAwait(false); }
+                catch { /* 同上。 */ }
+            }
+
+            if (_progressTask != null)
+            {
+                try { await _progressTask.ConfigureAwait(false); }
                 catch { /* 同上。 */ }
             }
 
@@ -437,6 +466,85 @@ public sealed partial class Suppressor : IDisposable
         }
     }
 
+    // ffmpeg 的 stderr 周期状态行（frame=… fps=…）在部分环境下根本不输出——真机日志实证：
+    // Windows 上 dxva2 硬解 + QSV 硬编、stderr 重定向为管道时，初始化日志行全都在、
+    // 周期 stats 一条都没有（只有进程结束时的终报），引擎无从解析 → UI 恒显 0%。
+    // -progress pipe:1 是 ffmpeg 专供程序消费的机读进度通道：按周期无条件输出 key=value 块，
+    // 不看终端脸色，且独占 stdout 与 stderr 日志互不穿插。stderr 的 stats 解析保留
+    // （正常环境两路并行，取值同源计算，互为冗余），stats 缺席的环境由这里兜底。
+    private void RunProgressReader(CancellationToken token)
+    {
+        if (_fProcess == null) return;
+        var stdout = _fProcess.StandardOutput;
+
+        try
+        {
+            // 机读块每行 \n 结尾（与 stats 的 \r 不同），ReadLine 无预读阻塞问题。
+            string? line;
+            while (!token.IsCancellationRequested && (line = stdout.ReadLine()) != null)
+            {
+                var eq = line.IndexOf('=');
+                if (eq <= 0) continue;
+                var key = line[..eq];
+                var val = line[(eq + 1)..].Trim();
+                switch (key)
+                {
+                    case "frame":
+                        if (int.TryParse(val, NumberStyles.Integer, CultureInfo.InvariantCulture, out var f))
+                            _pgFrame = f;
+                        break;
+                    case "fps":
+                        if (double.TryParse(val, NumberStyles.Float, CultureInfo.InvariantCulture, out var fp) && fp > 0)
+                            _pgFps = fp;
+                        break;
+                    case "out_time": // 编码初期为 N/A，解析失败即维持旧值
+                        if (TryParseFfmpegTime(val, out var sec))
+                            _pgOutTimeSec = sec;
+                        break;
+                    case "progress": // continue/end 都收束一次上报
+                        EmitProgressTick();
+                        break;
+                }
+            }
+        }
+        catch (Exception ex) when (
+            ex is IOException or ObjectDisposedException or OperationCanceledException)
+        {
+            // 进程被关闭时 ReadLine 会抛，吞。
+        }
+    }
+
+    /// <summary>把一个机读进度块折算成 OnProgress 上报，口径与 stderr stats 分支完全一致。</summary>
+    private void EmitProgressTick()
+    {
+        if (_pgFps > 0) _fps = _pgFps;
+
+        var total = ResolveTotalFrames();
+        int reported;
+        if (_durationSec > 0 && total > 0 && _pgOutTimeSec >= 0)
+        {
+            var ratio = Math.Clamp(_pgOutTimeSec / _durationSec, 0, 1);
+            reported = (int)Math.Round(ratio * total);
+        }
+        else
+        {
+            reported = total > 0 ? Math.Min(_pgFrame, total) : _pgFrame;
+        }
+
+        _frameCount = reported;
+        if (total > 0)
+            _callbacks.OnProgress?.Invoke(reported, total, _fps);
+
+        // stderr 没有 stats 行的环境，滚动日志里也补一条可折叠的进度行——
+        // 用户导出的日志能看到最后进度，不再只剩一堆初始化行。
+        if (!_sawStderrProgress)
+        {
+            var t = TimeSpan.FromSeconds(Math.Max(_pgOutTimeSec, 0));
+            _callbacks.OnProgressLogLine?.Invoke(
+                $"frame={reported} fps={_fps:0.0} time={t:hh\\:mm\\:ss\\.ff}");
+        }
+    }
+
     private void RunVapourLogReader(CancellationToken token)
     {
         if (_vProcess == null) return;
@@ -485,6 +593,7 @@ public sealed partial class Suppressor : IDisposable
                 _callbacks.OnLogLine?.Invoke(log);
 
             _lastLogLineWasProgress = true;
+            _sawStderrProgress = true;
 
             var total = ResolveTotalFrames();
 
@@ -562,16 +671,21 @@ public sealed partial class Suppressor : IDisposable
         if (_options.SourceFrameCount > 0) return _options.SourceFrameCount;
         // 探测拿不到帧数(不支持的编码/探测失败会返回 0)时也只探一次：否则每条进度行都会
         // 重开一个 VideoCapture 解码器(一秒数次)白吃资源。探不到就交给 ResolveTotalFrames 用
-        // 时长×源帧率 兜底。
-        if (_frameCountProbed) return 0;
-        _frameCountProbed = true;
-        if (string.IsNullOrEmpty(_options.SourceVideo) || !File.Exists(_options.SourceVideo))
-            return 0;
+        // 时长×源帧率 兜底。stderr stats 与 stdout progress 两个读取线程都会走到这里，
+        // 锁住保证真的只探一次。
+        lock (_probeGate)
+        {
+            if (_options.SourceFrameCount > 0) return _options.SourceFrameCount;
+            if (_frameCountProbed) return 0;
+            _frameCountProbed = true;
+            if (string.IsNullOrEmpty(_options.SourceVideo) || !File.Exists(_options.SourceVideo))
+                return 0;
 
-        using var capture = new VideoCapture(_options.SourceVideo);
-        var probed = (int)capture.Get(CapProp.FrameCount);
-        if (probed > 0) _options.SourceFrameCount = probed;
-        return probed > 0 ? probed : 0;
+            using var capture = new VideoCapture(_options.SourceVideo);
+            var probed = (int)capture.Get(CapProp.FrameCount);
+            if (probed > 0) _options.SourceFrameCount = probed;
+            return probed > 0 ? probed : 0;
+        }
     }
 
     private Process CreateVapourProcess(string vapourExecutable, string vapourScript)
@@ -615,12 +729,15 @@ public sealed partial class Suppressor : IDisposable
                 UseShellExecute = false,
                 CreateNoWindow = true,
                 RedirectStandardInput = true,
-                RedirectStandardOutput = false,
+                // stdout 专跑 -progress pipe:1 机读进度（RunProgressReader），与 stderr 日志互不穿插。
+                RedirectStandardOutput = true,
                 RedirectStandardError = true,
                 StandardErrorEncoding = Encoding.UTF8,
             },
         };
 
+        process.StartInfo.ArgumentList.Add("-progress");
+        process.StartInfo.ArgumentList.Add("pipe:1");
         process.StartInfo.ArgumentList.Add("-f");
         process.StartInfo.ArgumentList.Add("yuv4mpegpipe");
         process.StartInfo.ArgumentList.Add("-i");
@@ -652,7 +769,8 @@ public sealed partial class Suppressor : IDisposable
                 UseShellExecute = false,
                 CreateNoWindow = true,
                 RedirectStandardInput = false,
-                RedirectStandardOutput = false,
+                // stdout 专跑 -progress pipe:1 机读进度（RunProgressReader），与 stderr 日志互不穿插。
+                RedirectStandardOutput = true,
                 RedirectStandardError = true,
                 StandardErrorEncoding = Encoding.UTF8,
             },
@@ -660,6 +778,8 @@ public sealed partial class Suppressor : IDisposable
 
         process.StartInfo.ArgumentList.Add("-hide_banner");
         process.StartInfo.ArgumentList.Add("-y");
+        process.StartInfo.ArgumentList.Add("-progress");
+        process.StartInfo.ArgumentList.Add("pipe:1");
 
         AddHwAccelDecodeArgs(process.StartInfo.ArgumentList);
 
