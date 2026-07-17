@@ -98,9 +98,14 @@ public sealed partial class Suppressor : IDisposable
     private double _durationSec;
     // 从视频流 "N fps" 解析一次：仅当 EmguCV 拿不到帧数时，用 时长×帧率 兜底估算总帧数。
     private double _sourceFps;
-    // EmguCV 帧数探测是否已尝试过（哪怕返回 0）——避免每条进度行重开 VideoCapture。
-    private bool _frameCountProbed;
-    private readonly object _probeGate = new();
+    // EmguCV 探帧结果：>0=成功；0=未完成/失败（ResolveTotalFrames 用 时长×帧率 兜底）。
+    // 探测只在 StartFrameProbe 的独立后台线程跑：真机实证（Windows+QSV 报告者，2.3.3）
+    // VideoCapture 对部分视频/环境会无限挂死（MSMF）或抛非 IO 异常——旧版在进度读线程上
+    // 同步探帧，首个 tick 即卡死/线程死亡 → 机读通道全灭、完成/取消也被 await 卡住。
+    // 任何读取线程永远不许碰 EmguCV。
+    private volatile int _probedFrameCount;
+    // -progress 机读通道收到的行数（看门狗诊断用）。
+    private int _pgLineCount;
     private bool _lastLogLineWasProgress;
     // -progress pipe:1 机读进度块的累积值（stdout 读取线程独占写入，progress= 行收束上报）。
     private int _pgFrame;
@@ -139,13 +144,15 @@ public sealed partial class Suppressor : IDisposable
         _fps = 0;
         _durationSec = 0;
         _sourceFps = 0;
-        _frameCountProbed = false;
+        _probedFrameCount = 0;
+        _pgLineCount = 0;
         _lastLogLineWasProgress = false;
         _pgFrame = 0;
         _pgFps = 0;
         _pgOutTimeSec = -1;
         _sawStderrProgress = false;
         _cts = new CancellationTokenSource();
+        StartFrameProbe();
 
         switch (_runtime.Backend)
         {
@@ -160,6 +167,7 @@ public sealed partial class Suppressor : IDisposable
         }
 
         _callbacks.OnStarted?.Invoke();
+        StartProgressWatchdog();
         _ = Task.Run(WaitForExitAsync);
     }
 
@@ -209,7 +217,10 @@ public sealed partial class Suppressor : IDisposable
 
         try
         {
-            if (_progressTask != null) await _progressTask.ConfigureAwait(false);
+            // 限时等待：读线程已不做任何可挂死的调用（探帧移到了独立线程），此处限时只是保险——
+            // 取消绝不允许被进度线程拖死（否则 suppress.stop RPC 永不返回）。
+            if (_progressTask != null)
+                await Task.WhenAny(_progressTask, Task.Delay(3000)).ConfigureAwait(false);
         }
         catch
         {
@@ -315,7 +326,9 @@ public sealed partial class Suppressor : IDisposable
 
             if (_progressTask != null)
             {
-                try { await _progressTask.ConfigureAwait(false); }
+                // 限时等待（与 StopAsync 同理）：完成上报绝不允许被进度线程拖死，
+                // 否则 ffmpeg 都退出了任务还永远显示 running。
+                try { await Task.WhenAny(_progressTask, Task.Delay(3000)).ConfigureAwait(false); }
                 catch { /* 同上。 */ }
             }
 
@@ -483,6 +496,7 @@ public sealed partial class Suppressor : IDisposable
             string? line;
             while (!token.IsCancellationRequested && (line = stdout.ReadLine()) != null)
             {
+                Interlocked.Increment(ref _pgLineCount);
                 var eq = line.IndexOf('=');
                 if (eq <= 0) continue;
                 var key = line[..eq];
@@ -512,36 +526,51 @@ public sealed partial class Suppressor : IDisposable
         {
             // 进程被关闭时 ReadLine 会抛，吞。
         }
+        catch (Exception ex)
+        {
+            // 读线程绝不允许静默死亡（2.3.3 真机事故：一个异常吞掉整条机读通道却无迹可循）——
+            // 留一行日志，导出日志可见。
+            try { _callbacks.OnLogLine?.Invoke("[Sekai] 进度读取线程异常退出：" + ex.Message); }
+            catch { /* ignored */ }
+        }
     }
 
-    /// <summary>把一个机读进度块折算成 OnProgress 上报，口径与 stderr stats 分支完全一致。</summary>
+    /// <summary>把一个机读进度块折算成 OnProgress 上报，口径与 stderr stats 分支完全一致。
+    /// 整体 try/catch：单个 tick 出错只跳过本次上报，绝不让进度读取线程死亡。</summary>
     private void EmitProgressTick()
     {
-        if (_pgFps > 0) _fps = _pgFps;
-
-        var total = ResolveTotalFrames();
-        int reported;
-        if (_durationSec > 0 && total > 0 && _pgOutTimeSec >= 0)
+        try
         {
-            var ratio = Math.Clamp(_pgOutTimeSec / _durationSec, 0, 1);
-            reported = (int)Math.Round(ratio * total);
+            if (_pgFps > 0) _fps = _pgFps;
+
+            // 合成日志行先发、且只用机读块的原始值（不依赖总帧数解析）：后续链路无论出什么
+            // 状况，stderr 无 stats 的环境导出的日志里都至少留得下真实进度痕迹。
+            if (!_sawStderrProgress)
+            {
+                var t = TimeSpan.FromSeconds(Math.Max(_pgOutTimeSec, 0));
+                _callbacks.OnProgressLogLine?.Invoke(
+                    $"frame={_pgFrame} fps={_fps:0.0} time={t:hh\\:mm\\:ss\\.ff}");
+            }
+
+            var total = ResolveTotalFrames();
+            int reported;
+            if (_durationSec > 0 && total > 0 && _pgOutTimeSec >= 0)
+            {
+                var ratio = Math.Clamp(_pgOutTimeSec / _durationSec, 0, 1);
+                reported = (int)Math.Round(ratio * total);
+            }
+            else
+            {
+                reported = total > 0 ? Math.Min(_pgFrame, total) : _pgFrame;
+            }
+
+            _frameCount = reported;
+            if (total > 0)
+                _callbacks.OnProgress?.Invoke(reported, total, _fps);
         }
-        else
+        catch
         {
-            reported = total > 0 ? Math.Min(_pgFrame, total) : _pgFrame;
-        }
-
-        _frameCount = reported;
-        if (total > 0)
-            _callbacks.OnProgress?.Invoke(reported, total, _fps);
-
-        // stderr 没有 stats 行的环境，滚动日志里也补一条可折叠的进度行——
-        // 用户导出的日志能看到最后进度，不再只剩一堆初始化行。
-        if (!_sawStderrProgress)
-        {
-            var t = TimeSpan.FromSeconds(Math.Max(_pgOutTimeSec, 0));
-            _callbacks.OnProgressLogLine?.Invoke(
-                $"frame={reported} fps={_fps:0.0} time={t:hh\\:mm\\:ss\\.ff}");
+            // 跳过本次 tick，读取线程继续。
         }
     }
 
@@ -644,13 +673,75 @@ public sealed partial class Suppressor : IDisposable
         _lastLogLineWasProgress = false;
     }
 
-    /// <summary>总帧数(百分比分母)：优先 EmguCV 探测(一次性缓存)，拿不到时用 时长×源帧率 兜底。</summary>
+    /// <summary>总帧数(百分比分母)，非阻塞：优先 EmguCV 后台探测结果，没出结果/失败时用
+    /// 时长×源帧率 兜底，二者皆无返回 0(调用方跳过上报)。禁止在此做任何可能阻塞的调用。</summary>
     private int ResolveTotalFrames()
     {
-        var probed = GetFrameCount();
+        if (_options.SourceFrameCount > 0) return _options.SourceFrameCount;
+        var probed = _probedFrameCount;
         if (probed > 0) return probed;
         if (_durationSec > 0 && _sourceFps > 0) return (int)Math.Round(_durationSec * _sourceFps);
         return 0;
+    }
+
+    /// <summary>EmguCV 帧数探测，Start 时在独立后台线程跑一次。挂死(真机实证 Windows MSMF
+    /// 会无限 hang)只泄漏一条后台线程，进度走兜底口径不受影响；抛异常同理。
+    /// SEKAI_DEBUG_PROBE_HANG / SEKAI_DEBUG_PROBE_THROW 环境变量供自测复刻这两种故障。</summary>
+    private void StartFrameProbe()
+    {
+        if (_options.SourceFrameCount > 0)
+        {
+            _probedFrameCount = _options.SourceFrameCount;
+            return;
+        }
+
+        var video = _options.SourceVideo;
+        var thread = new Thread(() =>
+        {
+            try
+            {
+                if (Environment.GetEnvironmentVariable("SEKAI_DEBUG_PROBE_HANG") == "1")
+                    Thread.Sleep(Timeout.Infinite);
+                if (Environment.GetEnvironmentVariable("SEKAI_DEBUG_PROBE_THROW") == "1")
+                    throw new InvalidOperationException("SEKAI_DEBUG_PROBE_THROW");
+                if (string.IsNullOrEmpty(video) || !File.Exists(video)) return;
+
+                using var capture = new VideoCapture(video);
+                var probed = (int)capture.Get(CapProp.FrameCount);
+                if (probed > 0)
+                {
+                    // 回填 options：软编自动重试(SuppressHandler)复用同一份探测结果。
+                    _options.SourceFrameCount = probed;
+                    _probedFrameCount = probed;
+                }
+            }
+            catch
+            {
+                // 探测失败 → 兜底口径，进度不受影响。
+            }
+        }) { IsBackground = true, Name = "suppress-frame-probe" };
+        thread.Start();
+    }
+
+    /// <summary>启动 12 秒后两路进度(stderr stats / -progress 机读)都毫无动静时写一行诊断日志。
+    /// 真机故障排查全靠用户导出的日志，这一行能直接区分"通道没数据"和"处理链路死了"。</summary>
+    private void StartProgressWatchdog()
+    {
+        var token = _cts!.Token;
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await Task.Delay(TimeSpan.FromSeconds(12), token).ConfigureAwait(false);
+                if (_sawStderrProgress || Volatile.Read(ref _pgLineCount) > 0 || !IsRunning) return;
+                _callbacks.OnLogLine?.Invoke(
+                    "[Sekai] 诊断：启动 12 秒未收到任何进度输出（stderr 状态行与 -progress 机读通道均无）——请导出此日志反馈。");
+            }
+            catch
+            {
+                // 取消/Dispose → 直接退出。
+            }
+        });
     }
 
     /// <summary>解析 ffmpeg 的 HH:MM:SS(.ms) 时间为秒。失败返回 false（调用方自行走兜底）。</summary>
@@ -664,28 +755,6 @@ public sealed partial class Suppressor : IDisposable
         if (!double.TryParse(parts[2], NumberStyles.Float, CultureInfo.InvariantCulture, out var s)) return false;
         seconds = h * 3600 + m * 60 + s;
         return true;
-    }
-
-    private int GetFrameCount()
-    {
-        if (_options.SourceFrameCount > 0) return _options.SourceFrameCount;
-        // 探测拿不到帧数(不支持的编码/探测失败会返回 0)时也只探一次：否则每条进度行都会
-        // 重开一个 VideoCapture 解码器(一秒数次)白吃资源。探不到就交给 ResolveTotalFrames 用
-        // 时长×源帧率 兜底。stderr stats 与 stdout progress 两个读取线程都会走到这里，
-        // 锁住保证真的只探一次。
-        lock (_probeGate)
-        {
-            if (_options.SourceFrameCount > 0) return _options.SourceFrameCount;
-            if (_frameCountProbed) return 0;
-            _frameCountProbed = true;
-            if (string.IsNullOrEmpty(_options.SourceVideo) || !File.Exists(_options.SourceVideo))
-                return 0;
-
-            using var capture = new VideoCapture(_options.SourceVideo);
-            var probed = (int)capture.Get(CapProp.FrameCount);
-            if (probed > 0) _options.SourceFrameCount = probed;
-            return probed > 0 ? probed : 0;
-        }
     }
 
     private Process CreateVapourProcess(string vapourExecutable, string vapourScript)
