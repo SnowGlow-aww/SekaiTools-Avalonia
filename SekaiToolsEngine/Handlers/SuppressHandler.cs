@@ -59,7 +59,7 @@ public sealed class SuppressHandler
             _transport.SendNotification("suppress.log", new { line = "[Sekai] " + ffmpegDesc });
 
         // 字体子系统体检异步跑（进程内缓存，不阻塞启动）：健康机器亚秒出"正常"，
-        // 病机的"检测超时"会赶在挂起看门狗裁决前后落进任务日志——导出的日志自带病灶结论。
+        // 病机的"检测超时"会赶在挂起 watchdog 裁决前后落进任务日志——导出的日志自带病灶结论。
         _ = Task.Run(async () =>
         {
             try
@@ -114,7 +114,7 @@ public sealed class SuppressHandler
 
     /// <summary>
     /// 起步失败降级阶梯（至多两级重试）：
-    /// ① 疑似管线挂起（看门狗强杀）且硬解开着 → 只关硬解、编码器不变。真机实证
+    /// ① 疑似管线挂起（watchdog 强杀）且硬解开着 → 只关硬解、编码器不变。真机实证
     ///    （Windows+QSV 报告者）：EmguCV 探帧与 dxva2 硬件解码全挂死、QSV 试编码
     ///    却通过的机器——解码栈坏了但编码是好的，保住硬编速度；
     /// ② 其余起步失败（硬编报错退出：并行压制打满显卡编码会话 AMF→-19 / NVENC→-12、

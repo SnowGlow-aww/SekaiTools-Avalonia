@@ -73,7 +73,7 @@ public enum SuppressorStopReason
 }
 
 /// <summary>
-/// 管线挂起被看门狗强制终止（起步长时间零输出）。区别于普通报错退出：
+/// 管线挂起被 watchdog 强制终止（起步长时间零输出）。区别于普通报错退出：
 /// 上层（SuppressHandler）据此优先走"关硬解、编码器不变"的重试，而非直接降 x264。
 /// </summary>
 public sealed class SuppressPipelineHangException(string message) : Exception(message);
@@ -110,7 +110,7 @@ public sealed partial class Suppressor : IDisposable
     // 同步探帧，首个 tick 即卡死/线程死亡 → 机读通道全灭、完成/取消也被 await 卡住。
     // 任何读取线程永远不许碰 EmguCV。
     private volatile int _probedFrameCount;
-    // -progress 机读通道收到的行数（看门狗诊断用）。
+    // -progress 机读通道收到的行数（watchdog 诊断用）。
     private int _pgLineCount;
     private bool _lastLogLineWasProgress;
     // -progress pipe:1 机读进度块的累积值（stdout 读取线程独占写入，progress= 行收束上报）。
@@ -119,8 +119,10 @@ public sealed partial class Suppressor : IDisposable
     private double _pgOutTimeSec = -1;
     // stderr 是否出现过 stats 进度行：出现过则机读 tick 不再合成日志行，免得两路进度行交替刷屏。
     private volatile bool _sawStderrProgress;
-    // 看门狗判定管线挂起并强杀了子进程：收尾时以 SuppressPipelineHangException 收场。
+    // watchdog 判定管线挂起并强杀了子进程：收尾时以 SuppressPipelineHangException 收场。
     private volatile bool _hangAborted;
+    // 挂起的具体判词（起步挂起 / 静默模式中途挂起），随异常带给上层与日志。
+    private volatile string? _hangReason;
     private int _disposed;
 
     public Suppressor(SuppressorOptions options, SuppressorCallbacks callbacks)
@@ -160,6 +162,7 @@ public sealed partial class Suppressor : IDisposable
         _pgOutTimeSec = -1;
         _sawStderrProgress = false;
         _hangAborted = false;
+        _hangReason = null;
         _cts = new CancellationTokenSource();
         StartFrameProbe();
 
@@ -345,11 +348,11 @@ public sealed partial class Suppressor : IDisposable
             if (!canceled)
             {
                 failure = BuildExitFailure();
-                // 看门狗强杀的挂起：退出码信息（Kill 产生的 -1/137）没有诊断价值，
-                // 换成带类型标记的挂起异常，上层据此选降级路线。
+                // watchdog 强杀的挂起：退出码信息（Kill 产生的 -1/137）没有诊断价值，
+                // 换成带类型标记的挂起异常（判词由 watchdog 在强杀现场写好），上层据此选降级路线。
                 if (_hangAborted)
                     failure = new SuppressPipelineHangException(
-                        "压制管线挂起：启动后长时间无任何进度输出，已被看门狗终止" +
+                        (_hangReason ?? "压制管线挂起：长时间无任何进度输出，已被 watchdog 终止") +
                         (failure != null ? $"（{failure.Message.ReplaceLineEndings(" ")}）" : "。"));
                 if (failure != null)
                 {
@@ -738,12 +741,14 @@ public sealed partial class Suppressor : IDisposable
         thread.Start();
     }
 
-    /// <summary>两路进度(stderr stats / -progress 机读)持续毫无动静时的两级看门狗：
-    /// 12 秒先写一行诊断日志；到挂起阈值（默认 25 秒，SEKAI_SUPPRESS_HANG_ABORT_SECONDS
-    /// 可调，&lt;=0 关闭强杀只留诊断）仍零输出则判定管线挂起——真机实证（Windows+QSV
-    /// 报告者，2.3.5）：坏掉的硬件解码栈会让 ffmpeg 卡在首帧，无报错无输出永不退出，
-    /// 唯一出路是强杀子进程、以 SuppressPipelineHangException 收场让上层降级重试。
-    /// 出现过任何一行进度输出后永不触发（中途变慢/磁盘等待不属于起步挂起）。</summary>
+    /// <summary>两路进度(stderr stats / -progress 机读)持续毫无动静时的两级 watchdog：
+    /// 第一检查点（默认 12 秒）写诊断行并记录输出文件体积基线；到挂起阈值（默认 25 秒，
+    /// SEKAI_SUPPRESS_HANG_ABORT_SECONDS 可调，&lt;=0 关闭强杀只留诊断）仍零输出时先看
+    /// 输出文件是否在增长——**在长就绝不杀**（真机实证：报告者机器上 ffmpeg 在重定向管道下
+    /// stats 与 -progress 双双沉默但编码以近实时速度健康推进，疑似安全软件吞掉子进程管道
+    /// 输出），转入静默模式按输出体积粗估进度；只有零输出且文件不长的才按起步挂起强杀
+    /// （SuppressPipelineHangException 收场让上层降级重试）。
+    /// 出现过任何一行进度输出后 watchdog 全程退场（中途变慢/磁盘等待不属于起步挂起）。</summary>
     private void StartProgressWatchdog()
     {
         var token = _cts!.Token;
@@ -755,9 +760,11 @@ public sealed partial class Suppressor : IDisposable
                 var env = Environment.GetEnvironmentVariable("SEKAI_SUPPRESS_HANG_ABORT_SECONDS");
                 if (!string.IsNullOrEmpty(env) && int.TryParse(env, out var custom)) abortSeconds = custom;
 
-                var diagSeconds = abortSeconds <= 0 ? 12 : Math.Min(12, abortSeconds);
+                // 强杀阈值被调小（自测）时，第一检查点取其一半，保证有增长观察窗。
+                var diagSeconds = Math.Min(12, abortSeconds <= 0 ? 12 : Math.Max(1, abortSeconds / 2));
                 await Task.Delay(TimeSpan.FromSeconds(diagSeconds), token).ConfigureAwait(false);
                 if (HasProgressOutput() || !IsRunning) return;
+                var baselineSize = OutputFileSize();
                 if (diagSeconds >= 12)
                     _callbacks.OnLogLine?.Invoke(
                         "[Sekai] 诊断：启动 12 秒未收到任何进度输出（stderr 状态行与 -progress 机读通道均无）——请导出此日志反馈。");
@@ -769,9 +776,18 @@ public sealed partial class Suppressor : IDisposable
                     if (HasProgressOutput() || !IsRunning) return;
                 }
 
+                // 裁决点：输出文件在长 → 压制活着只是哑巴，转静默模式；不长才是真挂起。
+                var verdictSize = OutputFileSize();
+                if (verdictSize - baselineSize > SilentAliveGrowthBytes)
+                {
+                    await RunSilentModeAsync(verdictSize, token).ConfigureAwait(false);
+                    return;
+                }
+
                 _hangAborted = true;
+                _hangReason = "压制管线挂起：启动后长时间无任何进度输出且输出文件无增长，已被 watchdog 终止";
                 _callbacks.OnLogLine?.Invoke(
-                    $"[Sekai] 启动 {abortSeconds} 秒无任何进度输出：疑似解码/编码管线挂起，已自动终止压制进程。");
+                    $"[Sekai] 启动 {abortSeconds} 秒无任何进度输出且输出文件无增长：疑似解码/编码管线挂起，已自动终止压制进程。");
                 TryKill(_vProcess);
                 TryKill(_fProcess);
             }
@@ -780,6 +796,87 @@ public sealed partial class Suppressor : IDisposable
                 // 取消/Dispose → 直接退出。
             }
         });
+    }
+
+    // 静默模式判活阈值：mp4 头部/缓冲噪音在 KB 级，超过 64KB 的增长必然是媒体包在落盘。
+    private const long SilentAliveGrowthBytes = 64 * 1024;
+
+    /// <summary>静默模式：进度通道全哑但输出文件在增长——绝不终止，改按 输出体积/源体积
+    /// 粗估进度（CRF 模式成品体积未知，只能估算并封顶 99%，完成时由收尾路径补 100%）。
+    /// 文件长时间（默认 120 秒，SEKAI_SUPPRESS_SILENT_STALL_SECONDS 可调）不增长且
+    /// 通道仍无输出，才判中途挂起终止。通道恢复输出则静默模式解除、正常进度接管。</summary>
+    private async Task RunSilentModeAsync(long lastSize, CancellationToken token)
+    {
+        var stallSeconds = 120;
+        var env = Environment.GetEnvironmentVariable("SEKAI_SUPPRESS_SILENT_STALL_SECONDS");
+        if (!string.IsNullOrEmpty(env) && int.TryParse(env, out var custom) && custom > 0) stallSeconds = custom;
+
+        _callbacks.OnLogLine?.Invoke(
+            "[Sekai] watchdog 静默模式：两路进度通道均无输出，但输出文件正在增长——判定压制仍在进行，不终止。" +
+            "进度改按输出文件体积粗估。此情况常见于安全软件拦截了子进程的管道输出，" +
+            "可将引擎目录加入其白名单以恢复正常进度显示。");
+
+        long sourceSize = 0;
+        try
+        {
+            sourceSize = new FileInfo(_options.SourceVideo).Length;
+        }
+        catch
+        {
+            // 拿不到源体积就不合成百分比，只播报输出体积。
+        }
+
+        var stallWatch = Stopwatch.StartNew();
+        while (!token.IsCancellationRequested && IsRunning)
+        {
+            await Task.Delay(2000, token).ConfigureAwait(false);
+            if (HasProgressOutput())
+            {
+                _callbacks.OnLogLine?.Invoke("[Sekai] watchdog 静默模式解除：进度通道恢复输出。");
+                return;
+            }
+
+            var size = OutputFileSize();
+            if (size > lastSize)
+            {
+                lastSize = size;
+                stallWatch.Restart();
+            }
+            else if (stallWatch.Elapsed.TotalSeconds > stallSeconds)
+            {
+                _hangAborted = true;
+                _hangReason = "压制管线中途挂起：输出文件停止增长且进度通道始终无输出，已被 watchdog 终止";
+                _callbacks.OnLogLine?.Invoke(
+                    $"[Sekai] watchdog：静默模式下输出文件已 {stallSeconds} 秒无增长且进度通道仍无输出——判定管线中途挂起，已终止。");
+                TryKill(_vProcess);
+                TryKill(_fProcess);
+                return;
+            }
+
+            var total = ResolveTotalFrames();
+            if (sourceSize > 0 && total > 0)
+            {
+                var ratio = Math.Clamp((double)lastSize / sourceSize, 0, 0.99);
+                var estimated = (int)(ratio * total);
+                _frameCount = estimated;
+                _callbacks.OnProgress?.Invoke(estimated, total, 0);
+            }
+
+            _callbacks.OnProgressLogLine?.Invoke($"[Sekai] 静默压制中：输出 {lastSize / 1048576.0:0.0} MB");
+        }
+    }
+
+    private long OutputFileSize()
+    {
+        try
+        {
+            var info = new FileInfo(_options.OutputPath);
+            return info.Exists ? info.Length : 0;
+        }
+        catch
+        {
+            return 0;
+        }
     }
 
     private bool HasProgressOutput()
