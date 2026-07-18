@@ -133,6 +133,7 @@ public static class SuppressRuntimeService
                 CreateNoWindow = true,
             };
             psi.ArgumentList.Add("-hide_banner");
+            psi.ArgumentList.Add("-nostdin");
             psi.ArgumentList.Add("-encoders");
 
             using var proc = Process.Start(psi);
@@ -196,7 +197,7 @@ public static class SuppressRuntimeService
     }
 
     /// <summary>用几帧黑场真实跑一遍编码器，验证对应硬件/驱动确实存在且能初始化。
-    /// 失败时带回原因摘要（最后一行 stderr / 超时 / 异常），供探测结果与日志展示。</summary>
+    /// 失败时带回原因摘要（stderr 首个具体错误 / 超时 / 异常），供探测结果与日志展示。</summary>
     private static async Task<(bool Ok, string Reason)> VerifyEncoderAsync(string ffmpegPath, string encoderName)
     {
         Process? proc = null;
@@ -210,18 +211,23 @@ public static class SuppressRuntimeService
                 CreateNoWindow = true,
             };
             // 640x360：高于所有硬件编码器的最小分辨率限制，又足够小到瞬间完成。
+            // 旧探测只送 3 帧且完全依赖编码器默认码控：新版 QSV/NVENC/AMF 驱动会
+            // 因异步深度尚未排空或默认码控参数不完整而零包退出，实际正式压制却能跑。
+            // 这里送足 30 帧，并使用与正式压制相同家族的恒质量参数。
             psi.ArgumentList.Add("-hide_banner");
+            psi.ArgumentList.Add("-nostdin");
             psi.ArgumentList.Add("-loglevel");
             psi.ArgumentList.Add("error");
             psi.ArgumentList.Add("-f");
             psi.ArgumentList.Add("lavfi");
             psi.ArgumentList.Add("-i");
-            psi.ArgumentList.Add("color=black:s=640x360:r=30:d=0.2");
+            psi.ArgumentList.Add("color=black:s=640x360:r=30:d=1");
             psi.ArgumentList.Add("-frames:v");
-            psi.ArgumentList.Add("3");
+            psi.ArgumentList.Add("30");
             psi.ArgumentList.Add("-an");
             psi.ArgumentList.Add("-c:v");
             psi.ArgumentList.Add(encoderName);
+            AddProbeEncoderArgs(psi.ArgumentList, encoderName);
             psi.ArgumentList.Add("-f");
             psi.ArgumentList.Add("null");
             psi.ArgumentList.Add("-");
@@ -238,13 +244,23 @@ public static class SuppressRuntimeService
             await Task.WhenAll(stdoutDrain, stderrDrain);
             if (proc.ExitCode == 0) return (true, "");
 
-            // -loglevel error 下 stderr 基本只剩真正的错误，取最后一行非空即病灶。
-            var lastError = stderrDrain.Result
+            // FFmpeg 的最后一句经常只是 "Nothing was written..."，它会把前一行真正的
+            // 驱动/参数错误盖掉。优先回传最后两条具体错误，界面才能给出可操作原因。
+            var errorLines = stderrDrain.Result
                 .Split('\n', StringSplitOptions.RemoveEmptyEntries)
                 .Select(l => l.Trim())
-                .LastOrDefault(l => l.Length > 0) ?? "";
-            if (lastError.Length > 200) lastError = lastError[..200];
-            return (false, $"退出码 {proc.ExitCode}" + (lastError.Length > 0 ? "：" + lastError : ""));
+                .Where(l => l.Length > 0)
+                .ToList();
+            var concrete = errorLines
+                .Where(l => !l.Contains("Nothing was written into output file", StringComparison.OrdinalIgnoreCase))
+                // stderr 按“根因 → 连锁收尾错误”排列；首两条通常才是驱动拒绝原因，
+                // 末尾的 Task finished / Terminating 只是同一错误的包装。
+                .Take(2)
+                .ToList();
+            var summaryLines = concrete.Count > 0 ? concrete : errorLines.TakeLast(1).ToList();
+            var summary = string.Join(" | ", summaryLines);
+            if (summary.Length > 320) summary = summary[..320];
+            return (false, $"退出码 {proc.ExitCode}" + (summary.Length > 0 ? "：" + summary : ""));
         }
         catch (OperationCanceledException)
         {
@@ -259,6 +275,52 @@ public static class SuppressRuntimeService
         finally
         {
             proc?.Dispose();
+        }
+    }
+
+    /// <summary>试编码沿用正式压制的硬件码控核心参数，避免“默认参数不可用、正式参数可用”的
+    /// 假阴性。容器专用参数（如 hvc1 tag）不应传给 null muxer。</summary>
+    private static void AddProbeEncoderArgs(IList<string> args, string encoderName)
+    {
+        if (encoderName.EndsWith("_videotoolbox", StringComparison.Ordinal))
+        {
+            args.Add("-q:v"); args.Add("65");
+            if (encoderName.StartsWith("h264_", StringComparison.Ordinal))
+            {
+                args.Add("-profile:v"); args.Add("high");
+            }
+            args.Add("-allow_sw"); args.Add("1");
+            return;
+        }
+
+        if (encoderName.EndsWith("_nvenc", StringComparison.Ordinal))
+        {
+            args.Add("-preset"); args.Add("p4");
+            args.Add("-tune"); args.Add("hq");
+            args.Add("-rc"); args.Add("vbr");
+            args.Add("-cq"); args.Add("21");
+            args.Add("-b:v"); args.Add("0");
+            args.Add("-multipass"); args.Add("0");
+            return;
+        }
+
+        if (encoderName.EndsWith("_qsv", StringComparison.Ordinal))
+        {
+            args.Add("-global_quality"); args.Add("21");
+            return;
+        }
+
+        if (encoderName.EndsWith("_amf", StringComparison.Ordinal))
+        {
+            var qp = encoderName.StartsWith("av1_", StringComparison.Ordinal) ? "84" : "21";
+            args.Add("-quality"); args.Add("quality");
+            args.Add("-rc"); args.Add("cqp");
+            args.Add("-qp_i"); args.Add(qp);
+            args.Add("-qp_p"); args.Add(qp);
+            if (encoderName.StartsWith("h264_", StringComparison.Ordinal))
+            {
+                args.Add("-qp_b"); args.Add(qp);
+            }
         }
     }
 
@@ -325,6 +387,7 @@ public static class SuppressRuntimeService
                 CreateNoWindow = true,
             };
             psi.ArgumentList.Add("-hide_banner");
+            psi.ArgumentList.Add("-nostdin");
             psi.ArgumentList.Add("-loglevel");
             psi.ArgumentList.Add("error");
             psi.ArgumentList.Add("-f");

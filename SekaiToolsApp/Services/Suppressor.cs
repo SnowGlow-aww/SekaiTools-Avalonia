@@ -72,8 +72,8 @@ public enum SuppressorStopReason
     Failed,
 }
 
-/// <summary>watchdog 判定的挂起阶段。起步挂起适合先关闭硬解；中途挂起说明当前
-/// 编解码组合已经实际运行后死锁，应直接换全软件管线重跑。</summary>
+/// <summary>有充分证据时可判定的挂起阶段。当前 watchdog 只自动判定起步零产出挂起；
+/// 中途挂起必须来自比“进度/文件大小不变”更可靠的正面证据，不能据旁路静默猜测。</summary>
 public enum SuppressPipelineHangStage
 {
     Startup,
@@ -137,7 +137,7 @@ public sealed partial class Suppressor : IDisposable
     private volatile bool _sawStderrProgress;
     // watchdog 判定管线挂起并强杀了子进程：收尾时以 SuppressPipelineHangException 收场。
     private volatile bool _hangAborted;
-    // 挂起的具体判词（起步挂起 / 静默模式中途挂起），随异常带给上层与日志。
+    // 挂起的具体判词与阶段，随异常带给上层与日志。
     private volatile string? _hangReason;
     private volatile SuppressPipelineHangStage _hangStage;
     private int _disposed;
@@ -945,8 +945,10 @@ public sealed partial class Suppressor : IDisposable
 
     /// <summary>静默模式：进度通道全哑但输出文件在增长——绝不终止，改按 输出体积/源体积
     /// 粗估进度（CRF 模式成品体积未知，只能估算并封顶 99%，完成时由收尾路径补 100%）。
-    /// 文件长时间（默认 120 秒，SEKAI_SUPPRESS_SILENT_STALL_SECONDS 可调）不增长且
-    /// 通道仍无输出，才判中途挂起终止。通道恢复输出则静默模式解除、正常进度接管。</summary>
+    /// 文件长时间（默认 120 秒，SEKAI_SUPPRESS_SILENT_STALL_SECONDS 可调）不增长时只告警、
+    /// 不自动终止。MP4 写入、系统缓冲以及被安全软件拦截的进度通道都可能造成长时间“假静止”；
+    /// 一旦已经确认产生有效媒体数据，仅凭这些旁路信号无法安全证明编码器真的挂死。
+    /// 通道恢复输出则静默模式解除，用户也始终可以主动取消。</summary>
     private async Task RunSilentModeAsync(long lastSize, CancellationToken token)
     {
         var stallSeconds = 120;
@@ -969,6 +971,7 @@ public sealed partial class Suppressor : IDisposable
         }
 
         var stallWatch = Stopwatch.StartNew();
+        var stallWarningSent = false;
         while (!token.IsCancellationRequested && IsRunning)
         {
             await Task.Delay(2000, token).ConfigureAwait(false);
@@ -979,21 +982,19 @@ public sealed partial class Suppressor : IDisposable
             }
 
             var size = OutputFileSize();
-            if (size > lastSize)
+            var fileGrew = size > lastSize;
+            if (fileGrew)
             {
                 lastSize = size;
                 stallWatch.Restart();
+                stallWarningSent = false;
             }
-            else if (stallWatch.Elapsed.TotalSeconds > stallSeconds)
+            else if (!stallWarningSent && stallWatch.Elapsed.TotalSeconds > stallSeconds)
             {
-                _hangStage = SuppressPipelineHangStage.MidRun;
-                _hangReason = "压制管线中途挂起：输出文件停止增长且进度通道始终无输出，已被 watchdog 终止";
-                _hangAborted = true;
+                stallWarningSent = true;
                 _callbacks.OnLogLine?.Invoke(
-                    $"[Sekai] watchdog：静默模式下输出文件已 {stallSeconds} 秒无增长且进度通道仍无输出——判定管线中途挂起，已终止。");
-                TryKill(_vProcess);
-                TryKill(_fProcess);
-                return;
+                    $"[Sekai] watchdog：输出文件已 {stallSeconds} 秒无增长且进度通道仍无输出；" +
+                    "此前已确认产生有效媒体数据，无法安全判定编码器挂死，因此继续等待而不误杀。可随时手动取消。");
             }
 
             var total = ResolveTotalFrames();
@@ -1005,7 +1006,9 @@ public sealed partial class Suppressor : IDisposable
                 _callbacks.OnProgress?.Invoke(estimated, total, 0);
             }
 
-            _callbacks.OnProgressLogLine?.Invoke($"[Sekai] 静默压制中：输出 {lastSize / 1048576.0:0.0} MB");
+            var activity = stallWarningSent ? " · 暂无新落盘，继续等待" : "";
+            _callbacks.OnProgressLogLine?.Invoke(
+                $"[Sekai] 静默压制中：输出 {lastSize / 1048576.0:0.0} MB{activity}");
         }
     }
 
@@ -1086,6 +1089,9 @@ public sealed partial class Suppressor : IDisposable
             },
         };
 
+        // 后台/API 进程必须禁用 ffmpeg 的控制台读键线程。否则它会读取引擎继承来的
+        // NDJSON stdin（日志中的 "Press [q]"），与主进程争抢控制管道并可能中途挂起。
+        process.StartInfo.ArgumentList.Add("-nostdin");
         process.StartInfo.ArgumentList.Add("-progress");
         process.StartInfo.ArgumentList.Add(_progressFilePath ?? "pipe:1");
         process.StartInfo.ArgumentList.Add("-f");
@@ -1129,6 +1135,7 @@ public sealed partial class Suppressor : IDisposable
         };
 
         process.StartInfo.ArgumentList.Add("-hide_banner");
+        process.StartInfo.ArgumentList.Add("-nostdin");
         process.StartInfo.ArgumentList.Add("-y");
         process.StartInfo.ArgumentList.Add("-progress");
         process.StartInfo.ArgumentList.Add(_progressFilePath ?? "pipe:1");

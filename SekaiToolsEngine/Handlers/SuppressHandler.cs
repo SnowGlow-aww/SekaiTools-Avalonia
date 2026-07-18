@@ -99,10 +99,9 @@ public sealed class SuppressHandler
             },
             OnFinished = (reason, ex) =>
             {
-                // 普通失败仍只在起步零帧时降级；但 watchdog 明确认定的中途挂起必须
-                // 允许恢复。5.8.10 真机日志实证：哑巴 QSV 已写出 351.8 MB 后死锁，
-                // 静默模式的体积估算把 _progressFrames 置为非零，旧条件因此直接失败，
-                // 永远到不了全软件保底路线。用户主动取消仍不重试。
+                // 普通失败仍只在起步零帧时降级；保留对“有可靠正面证据的中途挂起”
+                // 异常的恢复能力。静默 watchdog 不再仅凭进度/文件大小不变创建该异常，
+                // 因为这种旁路信号在真机上会误杀健康的 QSV 与 x264。用户主动取消不重试。
                 var midRunHang = ex is SuppressPipelineHangException
                 {
                     Stage: SuppressPipelineHangStage.MidRun,
@@ -120,7 +119,7 @@ public sealed class SuppressHandler
 
     /// <summary>
     /// 失败自动恢复阶梯（至多两级重试）：
-    /// ⓪ 已经实际产出后又被 watchdog 判为中途挂起 → 直接切 x264 + 软件解码，
+    /// ⓪ 已经实际产出后又被可靠证据判为中途挂起 → 直接切 x264 + 软件解码，
     ///    覆盖未完成输出并从头重跑一次。此时当前硬件组合已经在真实长片负载下死锁，
     ///    仅关硬解再赌一次既浪费整片时间，也未必能绕过硬编驱动问题；
     /// ① 疑似管线挂起（watchdog 强杀）且硬解开着 → 只关硬解、编码器不变。真机实证
