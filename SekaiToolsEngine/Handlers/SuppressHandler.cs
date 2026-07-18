@@ -99,10 +99,16 @@ public sealed class SuppressHandler
             },
             OnFinished = (reason, ex) =>
             {
-                // "起步即失败"（一帧都没编出来）的自动降级阶梯，见 TryStartFallback。
-                // 已出过帧的失败不重试（问题不在起步），用户主动取消也不重试。
+                // 普通失败仍只在起步零帧时降级；但 watchdog 明确认定的中途挂起必须
+                // 允许恢复。5.8.10 真机日志实证：哑巴 QSV 已写出 351.8 MB 后死锁，
+                // 静默模式的体积估算把 _progressFrames 置为非零，旧条件因此直接失败，
+                // 永远到不了全软件保底路线。用户主动取消仍不重试。
+                var midRunHang = ex is SuppressPipelineHangException
+                {
+                    Stage: SuppressPipelineHangStage.MidRun,
+                };
                 if (reason == SuppressorStopReason.Failed
-                    && Volatile.Read(ref _progressFrames) == 0
+                    && (Volatile.Read(ref _progressFrames) == 0 || midRunHang)
                     && TryStartFallback(options, ex, attempt))
                     return;
 
@@ -113,7 +119,10 @@ public sealed class SuppressHandler
     }
 
     /// <summary>
-    /// 起步失败降级阶梯（至多两级重试）：
+    /// 失败自动恢复阶梯（至多两级重试）：
+    /// ⓪ 已经实际产出后又被 watchdog 判为中途挂起 → 直接切 x264 + 软件解码，
+    ///    覆盖未完成输出并从头重跑一次。此时当前硬件组合已经在真实长片负载下死锁，
+    ///    仅关硬解再赌一次既浪费整片时间，也未必能绕过硬编驱动问题；
     /// ① 疑似管线挂起（watchdog 强杀）且硬解开着 → 只关硬解、编码器不变。真机实证
     ///    （Windows+QSV 报告者）：EmguCV 探帧与 dxva2 硬件解码全挂死、QSV 试编码
     ///    却通过的机器——解码栈坏了但编码是好的，保住硬编速度；
@@ -125,11 +134,21 @@ public sealed class SuppressHandler
     {
         if (attempt >= 2) return false;
 
-        var hang = ex is SuppressPipelineHangException;
+        var hang = ex as SuppressPipelineHangException;
         SuppressorOptions fallback;
         string logLine;
 
-        if (hang && failed.UseHwAccelDecode)
+        if (hang?.Stage == SuppressPipelineHangStage.MidRun)
+        {
+            // 已经是最保守的全软件路线，再跑同一组合不会改变结果，防止失败循环。
+            if (failed.PreferredEncoder == VideoEncoder.Libx264 && !failed.UseHwAccelDecode)
+                return false;
+
+            fallback = CloneOptions(failed, VideoEncoder.Libx264, useHwAccelDecode: false);
+            logLine = "[Sekai] 压制在实际产出后停止增长——判定当前编解码管线中途挂起。" +
+                      "将覆盖未完成输出，并从头改用 x264 软编 + 软件解码自动重试一次。";
+        }
+        else if (hang != null && failed.UseHwAccelDecode)
         {
             fallback = CloneOptions(failed, failed.PreferredEncoder, useHwAccelDecode: false);
             logLine = "[Sekai] 疑似硬件解码挂起（起步零输出）——自动关闭硬解重试，" +
@@ -139,7 +158,7 @@ public sealed class SuppressHandler
         else if (IsHardwareEncoder(failed.PreferredEncoder))
         {
             fallback = CloneOptions(failed, VideoEncoder.Libx264, useHwAccelDecode: false);
-            logLine = hang
+            logLine = hang != null
                 ? "[Sekai] 管线仍挂起（起步零输出）——自动改用 x264 软编 + 软件解码重试。"
                 : $"[Sekai] 硬件编码器 {failed.PreferredEncoder} 启动即失败" +
                   $"（{ex?.Message?.ReplaceLineEndings(" ") ?? "未知原因"}）——" +
@@ -156,6 +175,10 @@ public sealed class SuppressHandler
             _transport.SendNotification("suppress.log", new { line = logLine });
             try
             {
+                // 中途挂起的静默估算进度属于上一轮；必须在新一轮启动前清零，
+                // 否则重试若又起步失败，会被误判成“已经出过帧”而挡住后续降级。
+                Interlocked.Exchange(ref _progressFrames, 0);
+                _transport.SendNotification("suppress.progress", new { frame = 0, total = 0, fps = 0.0 });
                 _suppressor?.Dispose();
                 _suppressor = new Suppressor(fallback, MakeCallbacks(fallback, attempt + 1));
                 _suppressor.Start();

@@ -72,11 +72,22 @@ public enum SuppressorStopReason
     Failed,
 }
 
+/// <summary>watchdog 判定的挂起阶段。起步挂起适合先关闭硬解；中途挂起说明当前
+/// 编解码组合已经实际运行后死锁，应直接换全软件管线重跑。</summary>
+public enum SuppressPipelineHangStage
+{
+    Startup,
+    MidRun,
+}
+
 /// <summary>
-/// 管线挂起被 watchdog 强制终止（起步长时间零输出）。区别于普通报错退出：
-/// 上层（SuppressHandler）据此优先走"关硬解、编码器不变"的重试，而非直接降 x264。
+/// 管线挂起被 watchdog 强制终止。区别于普通报错退出：上层（SuppressHandler）
+/// 根据 <see cref="Stage"/> 选择对应的自动恢复路线。
 /// </summary>
-public sealed class SuppressPipelineHangException(string message) : Exception(message);
+public sealed class SuppressPipelineHangException(string message, SuppressPipelineHangStage stage) : Exception(message)
+{
+    public SuppressPipelineHangStage Stage { get; } = stage;
+}
 
 /// <summary>
 /// 视频压制流水线。
@@ -96,8 +107,13 @@ public sealed partial class Suppressor : IDisposable
     private Task? _pipeTask;
     private Task? _logTask;
     private Task? _vLogTask;
+    private Task? _stdoutTask;
     private Task? _progressTask;
     private CancellationTokenSource? _cts;
+    // ffmpeg 的 -progress 机读输出走独立临时文件，不再走 stdout pipe。真机实证：
+    // 某些 Windows 安全软件/注入环境会让重定向 stdout 与 stderr 的周期输出双双消失，
+    // 甚至在长片尾部把管线拖死；普通文件 IO 不经过这条异常管道链路。
+    private string? _progressFilePath;
     private int _frameCount;
     private double _fps;
     // 从 ffmpeg 首部 "Duration:" 行解析一次：进度百分比一律按 out_time/总时长 计算(单调、被时长封顶)。
@@ -113,7 +129,7 @@ public sealed partial class Suppressor : IDisposable
     // -progress 机读通道收到的行数（watchdog 诊断用）。
     private int _pgLineCount;
     private bool _lastLogLineWasProgress;
-    // -progress pipe:1 机读进度块的累积值（stdout 读取线程独占写入，progress= 行收束上报）。
+    // -progress 机读进度块的累积值（进度文件读取线程独占写入，progress= 行收束上报）。
     private int _pgFrame;
     private double _pgFps;
     private double _pgOutTimeSec = -1;
@@ -123,6 +139,7 @@ public sealed partial class Suppressor : IDisposable
     private volatile bool _hangAborted;
     // 挂起的具体判词（起步挂起 / 静默模式中途挂起），随异常带给上层与日志。
     private volatile string? _hangReason;
+    private volatile SuppressPipelineHangStage _hangStage;
     private int _disposed;
 
     public Suppressor(SuppressorOptions options, SuppressorCallbacks callbacks)
@@ -163,7 +180,10 @@ public sealed partial class Suppressor : IDisposable
         _sawStderrProgress = false;
         _hangAborted = false;
         _hangReason = null;
+        _hangStage = SuppressPipelineHangStage.Startup;
         _cts = new CancellationTokenSource();
+        _progressFilePath = Path.Combine(Path.GetTempPath(),
+            $"sekai-suppress-progress-{Environment.ProcessId}-{Guid.NewGuid():N}.log");
         StartFrameProbe();
 
         switch (_runtime.Backend)
@@ -229,6 +249,16 @@ public sealed partial class Suppressor : IDisposable
 
         try
         {
+            if (_stdoutTask != null)
+                await Task.WhenAny(_stdoutTask, Task.Delay(3000)).ConfigureAwait(false);
+        }
+        catch
+        {
+            // 同上。
+        }
+
+        try
+        {
             // 限时等待：读线程已不做任何可挂死的调用（探帧移到了独立线程），此处限时只是保险——
             // 取消绝不允许被进度线程拖死（否则 suppress.stop RPC 永不返回）。
             if (_progressTask != null)
@@ -260,6 +290,7 @@ public sealed partial class Suppressor : IDisposable
         _pipeTask = Task.Run(() => RunPipe(_cts!.Token));
         _logTask = Task.Run(() => RunLogReader(_cts!.Token));
         _vLogTask = Task.Run(() => RunVapourLogReader(_cts!.Token));
+        _stdoutTask = Task.Run(() => RunUnusedStdoutReader(_cts!.Token));
         _progressTask = Task.Run(() => RunProgressReader(_cts!.Token));
     }
 
@@ -274,6 +305,7 @@ public sealed partial class Suppressor : IDisposable
         BoostProcessPriority(_fProcess);
 
         _logTask = Task.Run(() => RunLogReader(_cts!.Token));
+        _stdoutTask = Task.Run(() => RunUnusedStdoutReader(_cts!.Token));
         _progressTask = Task.Run(() => RunProgressReader(_cts!.Token));
     }
 
@@ -336,6 +368,12 @@ public sealed partial class Suppressor : IDisposable
                 catch { /* 同上。 */ }
             }
 
+            if (_stdoutTask != null)
+            {
+                try { await Task.WhenAny(_stdoutTask, Task.Delay(3000)).ConfigureAwait(false); }
+                catch { /* 同上。 */ }
+            }
+
             if (_progressTask != null)
             {
                 // 限时等待（与 StopAsync 同理）：完成上报绝不允许被进度线程拖死，
@@ -343,6 +381,8 @@ public sealed partial class Suppressor : IDisposable
                 try { await Task.WhenAny(_progressTask, Task.Delay(3000)).ConfigureAwait(false); }
                 catch { /* 同上。 */ }
             }
+
+            TryDeleteProgressFile();
 
             canceled = _cts?.IsCancellationRequested ?? false;
             if (!canceled)
@@ -353,7 +393,8 @@ public sealed partial class Suppressor : IDisposable
                 if (_hangAborted)
                     failure = new SuppressPipelineHangException(
                         (_hangReason ?? "压制管线挂起：长时间无任何进度输出，已被 watchdog 终止") +
-                        (failure != null ? $"（{failure.Message.ReplaceLineEndings(" ")}）" : "。"));
+                        (failure != null ? $"（{failure.Message.ReplaceLineEndings(" ")}）" : "。"),
+                        _hangStage);
                 if (failure != null)
                 {
                     _callbacks.OnLogLine?.Invoke($"[Sekai] 压制后端异常退出：{failure.Message}");
@@ -500,12 +541,18 @@ public sealed partial class Suppressor : IDisposable
     // ffmpeg 的 stderr 周期状态行（frame=… fps=…）在部分环境下根本不输出——真机日志实证：
     // Windows 上 dxva2 硬解 + QSV 硬编、stderr 重定向为管道时，初始化日志行全都在、
     // 周期 stats 一条都没有（只有进程结束时的终报），引擎无从解析 → UI 恒显 0%。
-    // -progress pipe:1 是 ffmpeg 专供程序消费的机读进度通道：按周期无条件输出 key=value 块，
-    // 不看终端脸色，且独占 stdout 与 stderr 日志互不穿插。stderr 的 stats 解析保留
-    // （正常环境两路并行，取值同源计算，互为冗余），stats 缺席的环境由这里兜底。
+    // 2.3.3 曾用 -progress pipe:1 作冗余，但报告者机器连这条 stdout pipe 也会全程沉默；
+    // 2.3.8 改让 -progress 写独立临时文件，这里增量轮询，绕开异常的子进程输出管道。
+    // stderr stats 解析仍保留，两路取值同源、互为冗余。
     private void RunProgressReader(CancellationToken token)
     {
         if (_fProcess == null) return;
+        if (!string.IsNullOrEmpty(_progressFilePath))
+        {
+            RunProgressFileReader(_progressFilePath, token);
+            return;
+        }
+
         var stdout = _fProcess.StandardOutput;
 
         try
@@ -513,31 +560,7 @@ public sealed partial class Suppressor : IDisposable
             // 机读块每行 \n 结尾（与 stats 的 \r 不同），ReadLine 无预读阻塞问题。
             string? line;
             while (!token.IsCancellationRequested && (line = stdout.ReadLine()) != null)
-            {
-                Interlocked.Increment(ref _pgLineCount);
-                var eq = line.IndexOf('=');
-                if (eq <= 0) continue;
-                var key = line[..eq];
-                var val = line[(eq + 1)..].Trim();
-                switch (key)
-                {
-                    case "frame":
-                        if (int.TryParse(val, NumberStyles.Integer, CultureInfo.InvariantCulture, out var f))
-                            _pgFrame = f;
-                        break;
-                    case "fps":
-                        if (double.TryParse(val, NumberStyles.Float, CultureInfo.InvariantCulture, out var fp) && fp > 0)
-                            _pgFps = fp;
-                        break;
-                    case "out_time": // 编码初期为 N/A，解析失败即维持旧值
-                        if (TryParseFfmpegTime(val, out var sec))
-                            _pgOutTimeSec = sec;
-                        break;
-                    case "progress": // continue/end 都收束一次上报
-                        EmitProgressTick();
-                        break;
-                }
-            }
+                ConsumeProgressLine(line);
         }
         catch (Exception ex) when (
             ex is IOException or ObjectDisposedException or OperationCanceledException)
@@ -550,6 +573,124 @@ public sealed partial class Suppressor : IDisposable
             // 留一行日志，导出日志可见。
             try { _callbacks.OnLogLine?.Invoke("[Sekai] 进度读取线程异常退出：" + ex.Message); }
             catch { /* ignored */ }
+        }
+    }
+
+    /// <summary>stdout 仍重定向并持续排空，防止 ffmpeg/第三方库的意外输出混进父进程
+    /// 的 NDJSON stdout；真正的机读进度已走文件，这里不解析内容。</summary>
+    private void RunUnusedStdoutReader(CancellationToken token)
+    {
+        if (_fProcess == null || string.IsNullOrEmpty(_progressFilePath)
+            || !_fProcess.StartInfo.RedirectStandardOutput) return;
+        try
+        {
+            var stream = _fProcess.StandardOutput;
+            var buffer = new char[1024];
+            while (!token.IsCancellationRequested && stream.Read(buffer, 0, buffer.Length) > 0)
+            {
+                // drain only
+            }
+        }
+        catch (Exception ex) when (
+            ex is IOException or ObjectDisposedException or OperationCanceledException)
+        {
+            // 进程结束/取消时关闭管道是正常路径。
+        }
+    }
+
+    /// <summary>增量读取 ffmpeg 正在追加的 -progress 文件。每次短暂打开并带
+    /// FileShare.ReadWrite，Windows 上不长期占句柄，取消/降级重试也能立即清理文件。</summary>
+    private void RunProgressFileReader(string path, CancellationToken token)
+    {
+        long offset = 0;
+        var pending = string.Empty;
+        var buffer = new byte[4096];
+
+        try
+        {
+            while (!token.IsCancellationRequested)
+            {
+                var readAny = false;
+                try
+                {
+                    using var stream = new FileStream(path, FileMode.Open, FileAccess.Read,
+                        FileShare.ReadWrite | FileShare.Delete);
+                    if (stream.Length < offset)
+                    {
+                        // 理论上 GUID 路径不会被截断；留此守卫防外部清理工具原地重建。
+                        offset = 0;
+                        pending = string.Empty;
+                    }
+
+                    stream.Position = offset;
+                    int read;
+                    while ((read = stream.Read(buffer, 0, buffer.Length)) > 0)
+                    {
+                        readAny = true;
+                        offset += read;
+                        pending += Encoding.UTF8.GetString(buffer, 0, read);
+
+                        int newline;
+                        while ((newline = pending.IndexOf('\n')) >= 0)
+                        {
+                            ConsumeProgressLine(pending[..newline].TrimEnd('\r'));
+                            pending = pending[(newline + 1)..];
+                        }
+                    }
+                }
+                catch (FileNotFoundException)
+                {
+                    // ffmpeg 尚未创建进度文件；下一轮再看。
+                }
+                catch (IOException)
+                {
+                    // ffmpeg 正在创建/替换文件的极短窗口；下一轮重试。
+                }
+                catch (UnauthorizedAccessException)
+                {
+                    // 安全软件短暂扫描/锁定临时文件；下一轮重试。
+                }
+
+                if (!IsRunning && !readAny)
+                {
+                    if (pending.Length > 0) ConsumeProgressLine(pending.TrimEnd('\r'));
+                    return;
+                }
+
+                Thread.Sleep(100);
+            }
+        }
+        catch (Exception ex)
+        {
+            try { _callbacks.OnLogLine?.Invoke("[Sekai] 进度文件读取线程异常退出：" + ex.Message); }
+            catch { /* ignored */ }
+        }
+    }
+
+    private void ConsumeProgressLine(string line)
+    {
+        Interlocked.Increment(ref _pgLineCount);
+        var eq = line.IndexOf('=');
+        if (eq <= 0) return;
+        var key = line[..eq];
+        var val = line[(eq + 1)..].Trim();
+        switch (key)
+        {
+            case "frame":
+                if (int.TryParse(val, NumberStyles.Integer, CultureInfo.InvariantCulture, out var f))
+                    _pgFrame = f;
+                break;
+            case "fps":
+                if (double.TryParse(val, NumberStyles.Float, CultureInfo.InvariantCulture, out var fp) && fp > 0)
+                    _pgFps = fp;
+                break;
+            case "out_time": // 编码初期为 N/A，解析失败即维持旧值
+                if (TryParseFfmpegTime(val, out var sec))
+                    _pgOutTimeSec = sec;
+                break;
+            case "progress": // continue/end 都收束一次上报
+                EmitProgressTick();
+                break;
         }
     }
 
@@ -767,7 +908,7 @@ public sealed partial class Suppressor : IDisposable
                 var baselineSize = OutputFileSize();
                 if (diagSeconds >= 12)
                     _callbacks.OnLogLine?.Invoke(
-                        "[Sekai] 诊断：启动 12 秒未收到任何进度输出（stderr 状态行与 -progress 机读通道均无）——请导出此日志反馈。");
+                        "[Sekai] 诊断：启动 12 秒未收到任何进度输出（stderr 状态行与 -progress 机读文件均无）——请导出此日志反馈。");
 
                 if (abortSeconds <= 0) return;
                 if (abortSeconds > diagSeconds)
@@ -784,8 +925,9 @@ public sealed partial class Suppressor : IDisposable
                     return;
                 }
 
-                _hangAborted = true;
+                _hangStage = SuppressPipelineHangStage.Startup;
                 _hangReason = "压制管线挂起：启动后长时间无任何进度输出且输出文件无增长，已被 watchdog 终止";
+                _hangAborted = true;
                 _callbacks.OnLogLine?.Invoke(
                     $"[Sekai] 启动 {abortSeconds} 秒无任何进度输出且输出文件无增长：疑似解码/编码管线挂起，已自动终止压制进程。");
                 TryKill(_vProcess);
@@ -812,9 +954,9 @@ public sealed partial class Suppressor : IDisposable
         if (!string.IsNullOrEmpty(env) && int.TryParse(env, out var custom) && custom > 0) stallSeconds = custom;
 
         _callbacks.OnLogLine?.Invoke(
-            "[Sekai] watchdog 静默模式：两路进度通道均无输出，但输出文件正在增长——判定压制仍在进行，不终止。" +
-            "进度改按输出文件体积粗估。此情况常见于安全软件拦截了子进程的管道输出，" +
-            "可将引擎目录加入其白名单以恢复正常进度显示。");
+            "[Sekai] watchdog 静默模式：stderr 状态行与机读进度文件均无更新，但输出文件正在增长——" +
+            "判定压制仍在进行，不终止。进度改按输出文件体积粗估。此情况可能由安全软件或异常运行环境" +
+            "拦截 ffmpeg 状态输出导致，可将引擎目录加入其白名单以恢复正常进度显示。");
 
         long sourceSize = 0;
         try
@@ -844,8 +986,9 @@ public sealed partial class Suppressor : IDisposable
             }
             else if (stallWatch.Elapsed.TotalSeconds > stallSeconds)
             {
-                _hangAborted = true;
+                _hangStage = SuppressPipelineHangStage.MidRun;
                 _hangReason = "压制管线中途挂起：输出文件停止增长且进度通道始终无输出，已被 watchdog 终止";
+                _hangAborted = true;
                 _callbacks.OnLogLine?.Invoke(
                     $"[Sekai] watchdog：静默模式下输出文件已 {stallSeconds} 秒无增长且进度通道仍无输出——判定管线中途挂起，已终止。");
                 TryKill(_vProcess);
@@ -936,7 +1079,7 @@ public sealed partial class Suppressor : IDisposable
                 UseShellExecute = false,
                 CreateNoWindow = true,
                 RedirectStandardInput = true,
-                // stdout 专跑 -progress pipe:1 机读进度（RunProgressReader），与 stderr 日志互不穿插。
+                // stdout 只作隔离排空；-progress 写独立临时文件，由 RunProgressReader 轮询。
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
                 StandardErrorEncoding = Encoding.UTF8,
@@ -944,7 +1087,7 @@ public sealed partial class Suppressor : IDisposable
         };
 
         process.StartInfo.ArgumentList.Add("-progress");
-        process.StartInfo.ArgumentList.Add("pipe:1");
+        process.StartInfo.ArgumentList.Add(_progressFilePath ?? "pipe:1");
         process.StartInfo.ArgumentList.Add("-f");
         process.StartInfo.ArgumentList.Add("yuv4mpegpipe");
         process.StartInfo.ArgumentList.Add("-i");
@@ -976,7 +1119,9 @@ public sealed partial class Suppressor : IDisposable
                 UseShellExecute = false,
                 CreateNoWindow = true,
                 RedirectStandardInput = false,
-                // stdout 专跑 -progress pipe:1 机读进度（RunProgressReader），与 stderr 日志互不穿插。
+                // -progress 写独立临时文件，绕开报告者机器上 stdout pipe 周期输出全哑的
+                // 异常环境；stdout 仍隔离重定向但不承载进度，只由 drain 线程排空，避免
+                // 意外文本继承写入父进程的 NDJSON 通道。
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
                 StandardErrorEncoding = Encoding.UTF8,
@@ -986,7 +1131,7 @@ public sealed partial class Suppressor : IDisposable
         process.StartInfo.ArgumentList.Add("-hide_banner");
         process.StartInfo.ArgumentList.Add("-y");
         process.StartInfo.ArgumentList.Add("-progress");
-        process.StartInfo.ArgumentList.Add("pipe:1");
+        process.StartInfo.ArgumentList.Add(_progressFilePath ?? "pipe:1");
 
         AddHwAccelDecodeArgs(process.StartInfo.ArgumentList);
 
@@ -1328,6 +1473,20 @@ public sealed partial class Suppressor : IDisposable
         }
     }
 
+    private void TryDeleteProgressFile()
+    {
+        if (string.IsNullOrEmpty(_progressFilePath)) return;
+        try
+        {
+            File.Delete(_progressFilePath);
+        }
+        catch
+        {
+            // 进程刚被 Kill 时 Windows 可能仍短暂持有句柄；Dispose/收尾会再试，
+            // 最坏只在系统临时目录留一个很小的文本文件，不影响成品。
+        }
+    }
+
     private void EnsureSourceExists()
     {
         if (string.IsNullOrEmpty(_options.SourceVideo) || !File.Exists(_options.SourceVideo))
@@ -1350,6 +1509,7 @@ public sealed partial class Suppressor : IDisposable
         try { _vProcess?.Dispose(); } catch { /* ignored */ }
         try { _fProcess?.Dispose(); } catch { /* ignored */ }
         try { _cts?.Dispose(); } catch { /* ignored */ }
+        TryDeleteProgressFile();
 
         _vProcess = null;
         _fProcess = null;
