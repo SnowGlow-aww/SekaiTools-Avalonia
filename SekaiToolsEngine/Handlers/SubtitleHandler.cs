@@ -38,6 +38,7 @@ public sealed class SubtitleHandler
         dispatcher.Register("subtitle.lines", LinesAsync);
         dispatcher.Register("subtitle.setSeparator", SetSeparatorAsync);
         dispatcher.Register("subtitle.setTranslation", SetTranslationAsync);
+        dispatcher.Register("subtitle.setBannerTranslation", SetBannerTranslationAsync);
         dispatcher.Register("subtitle.estimateSeparator", EstimateSeparatorAsync);
         dispatcher.Register("subtitle.frame", FrameAsync);
     }
@@ -398,22 +399,32 @@ public sealed class SubtitleHandler
         lock (_lock)
         {
             var set = DialogAt(index);
-            set.Data.BodyTranslated = text;
-            var len = text.TrimAll().Length;
-            var nl = text.IndexOf('\n');
-            var ci = nl > 0
-                ? text[..nl].TrimAll().Length // 显式换行：分割点=第一行长（与 GUI QuickEdit 一致）
-                : set.Separate.SeparatorContentIndex;
-            ci = Math.Clamp(ci, 1, Math.Max(1, len - 1));
-
+            // Web 编辑器会收到/允许输入字面的 ASS \N；桌面 QuickEdit 则提交真实换行。
+            // 两者都必须立即刷新文本分割点，否则导出虽然生成两条时间轴，正文仍按旧索引切开。
+            bool? useSeparator = null;
             if (p.TryGetProperty("useSeparator", out var us) &&
                 us.ValueKind is JsonValueKind.True or JsonValueKind.False)
-                set.UseSeparator = us.GetBoolean();
-            else
-                set.UseSeparator = set.NeedSetSeparator;
+                useSeparator = us.GetBoolean();
 
-            set.SetSeparator(set.Separate.SeparateFrame, ci);
+            set.ApplyTranslation(text, useSeparator);
             return Task.FromResult<object?>(SerializeDialog(set, index));
+        }
+    }
+
+    private Task<object?> SetBannerTranslationAsync(JsonElement? @params)
+    {
+        if (@params == null) throw new ArgumentException("params required");
+        var p = @params.Value;
+        var index = RequireIndex(p);
+        if (!p.TryGetProperty("text", out var t) || t.ValueKind != JsonValueKind.String)
+            throw new ArgumentException("text required");
+        var text = (t.GetString() ?? "").Replace("\r\n", "\n").Replace('\r', '\n');
+
+        lock (_lock)
+        {
+            var set = BannerAt(index);
+            set.Data.BodyTranslated = text;
+            return Task.FromResult<object?>(SerializeFrameSet(set, index));
         }
     }
 
@@ -498,6 +509,15 @@ public sealed class SubtitleHandler
         if (index < 0 || index >= _dialogs.Count)
             throw new ArgumentException($"index 越界: {index} (共 {_dialogs.Count} 条)");
         return _dialogs[index];
+    }
+
+    // banner 与 dialog 各自独立编号，不能复用 DialogAt；否则同 index 会误改一条对话。
+    // 仅在持有 _lock 时调用。
+    private BannerBaseFrameSet BannerAt(int index)
+    {
+        if (index < 0 || index >= _banners.Count)
+            throw new ArgumentException($"banner index 越界: {index} (共 {_banners.Count} 条)");
+        return _banners[index];
     }
 
     private static int RequireIndex(JsonElement p)

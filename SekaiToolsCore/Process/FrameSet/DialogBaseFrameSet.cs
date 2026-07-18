@@ -34,25 +34,7 @@ public partial class DialogBaseFrameSet : BaseFrameSet
     {
         Data = data;
         Fps = fps;
-        UseSeparator = NeedSetSeparator;
-
-        #region InitSeparatorContentIndex
-
-        int separatorContentIndex;
-
-        if (Data.BodyTranslated.Contains("\\R"))
-            separatorContentIndex = Data.BodyTranslated
-                .Replace("\n", "").Replace("\\N", "")
-                .IndexOf("\\R", StringComparison.Ordinal);
-        else if (Data.BodyTranslated.Count(c => c == '\n') == 1)
-            separatorContentIndex = Data.BodyTranslated
-                .IndexOf("\\R", StringComparison.Ordinal);
-        else
-            separatorContentIndex = Data.BodyTranslated.TrimAll().Length / 2;
-
-        Separate.SeparatorContentIndex = separatorContentIndex;
-
-        #endregion
+        ApplyTranslation(Data.BodyTranslated);
     }
 
     public DialogStoryEvent Data { get; }
@@ -69,6 +51,36 @@ public partial class DialogBaseFrameSet : BaseFrameSet
                                     Data.BodyTranslated.TrimAll().Length > 37;
 
     public bool UseSeparator { get; set; }
+
+    /// <summary>
+    /// 应用译文并同步分轴状态。真实换行、字面 \N/\n 与专用 \R 都会刷新文本分割点；
+    /// useSeparator 非空时尊重 UI 的明确选择，否则保持旧版按过长阈值自动判断的语义。
+    /// </summary>
+    public void ApplyTranslation(string text, bool? useSeparator = null)
+    {
+        Data.SetTranslationContent(text);
+        var contentLength = text.TrimAll().Length;
+        var explicitSeparatorContentIndex = text.ExplicitSeparatorContentIndex();
+        var validExplicitSeparatorContentIndex = explicitSeparatorContentIndex is > 0 &&
+                                                  explicitSeparatorContentIndex < contentLength
+            ? explicitSeparatorContentIndex
+            : null;
+        var existingSeparatorContentIndex = Separate.SeparatorContentIndex > 0 &&
+                                            Separate.SeparatorContentIndex < contentLength
+            ? Separate.SeparatorContentIndex
+            : (int?)null;
+        var separatorContentIndex = validExplicitSeparatorContentIndex
+                                    ?? existingSeparatorContentIndex
+                                    ?? contentLength / 2;
+        separatorContentIndex = contentLength > 1
+            ? Math.Clamp(separatorContentIndex, 1, contentLength - 1)
+            : Math.Max(0, separatorContentIndex);
+
+        // \N 也可能只是排版换行。构造 FrameSet/旧调用方未明确选择时，不能仅凭标记
+        // 把短三行译文变成两条时间轴；Web/QuickEdit 的显式选择由 useSeparator 传入。
+        UseSeparator = useSeparator ?? NeedSetSeparator;
+        SetSeparator(Separate.SeparateFrame, separatorContentIndex);
+    }
 
     public void InitSeparator()
     {
