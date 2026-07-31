@@ -48,6 +48,9 @@
         <PackageReference Include="FluentAvaloniaUI" Version="2.2.0" />
         <PackageReference Include="CommunityToolkit.Mvvm" Version="8.4.0" />
         <PackageReference Include="Microsoft.Extensions.DependencyInjection" Version="9.0.0" />
+        <!-- Avalonia.FreeDesktop 11.2.3 transitively pins vulnerable 0.20.0 (CVE-2026-39959).
+             0.21.3 is the upstream backport containing the protocol fixes without the 0.92 API jump. -->
+        <PackageReference Include="Tmds.DBus.Protocol" Version="0.21.3" />
     </ItemGroup>
 
     <ItemGroup>

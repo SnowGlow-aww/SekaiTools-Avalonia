@@ -19,14 +19,16 @@ namespace SekaiToolsApp.Views.Pages;
 /// 视频压制页 code-behind。本类做 UI 编排（文件对话框、资源引导、生命周期管理），
 /// <see cref="Suppressor"/> 跑后台子进程，<see cref="SuppressPageViewModel"/> 承载状态。
 /// </summary>
-public partial class SuppressPageView : UserControl
+public partial class SuppressPageView : UserControl, IAsyncDisposable
 {
     private static readonly string[] VideoExtensions = [".mp4", ".avi", ".mkv", ".webm", ".wmv"];
     private static readonly string[] SubtitleExtensions = [".ass"];
 
     private readonly SuppressPageViewModel _viewModel = new();
     private Suppressor? _suppressor;
+    private Task? _startupTask;
     private int _runSessionId;
+    private volatile bool _disposed;
 
     public SuppressPageView()
     {
@@ -108,7 +110,7 @@ public partial class SuppressPageView : UserControl
 
     private async void OnStartClicked(object? sender, RoutedEventArgs e)
     {
-        if (_viewModel.IsRunning) return;
+        if (_disposed || _viewModel.IsRunning) return;
         if (!_viewModel.IsPlatformSupported)
         {
             await ShowErrorAsync("平台不支持",
@@ -147,12 +149,18 @@ public partial class SuppressPageView : UserControl
 
         Suppressor? suppressor = null;
         Exception? constructError = null;
-        await Task.Run(() =>
+        var startupTask = Task.Run(() =>
         {
             try
             {
                 suppressor = new Suppressor(options, BuildCallbacks(sessionId));
                 suppressor.Start();
+                if (_disposed || sessionId != Volatile.Read(ref _runSessionId))
+                {
+                    suppressor.StopAsync().GetAwaiter().GetResult();
+                    suppressor.Dispose();
+                    suppressor = null;
+                }
             }
             catch (Exception ex)
             {
@@ -161,6 +169,26 @@ public partial class SuppressPageView : UserControl
                 suppressor = null;
             }
         });
+        _startupTask = startupTask;
+        try
+        {
+            await startupTask;
+        }
+        finally
+        {
+            if (ReferenceEquals(_startupTask, startupTask))
+                _startupTask = null;
+        }
+
+        if (_disposed || sessionId != _runSessionId)
+        {
+            if (suppressor != null)
+            {
+                try { await suppressor.StopAsync(); }
+                finally { suppressor.Dispose(); }
+            }
+            return;
+        }
 
         if (constructError != null || suppressor == null)
         {
@@ -324,6 +352,7 @@ public partial class SuppressPageView : UserControl
     {
         return Dispatcher.UIThread.InvokeAsync(() =>
         {
+            if (_disposed) return;
             _viewModel.ResourceState = state;
             _viewModel.ResourceStatusText = text;
         }).GetTask();
@@ -390,6 +419,29 @@ public partial class SuppressPageView : UserControl
         return inner != null
             ? $"{ex.Message}\n\n内层错误：{inner.GetType().Name}: {inner.Message}"
             : ex.Message;
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        if (_disposed) return;
+        _disposed = true;
+        ++_runSessionId;
+        var startup = _startupTask;
+        if (startup != null)
+            await startup.ConfigureAwait(false);
+
+        var current = _suppressor;
+        _suppressor = null;
+        if (current == null) return;
+
+        try
+        {
+            await current.StopAsync();
+        }
+        finally
+        {
+            current.Dispose();
+        }
     }
 
     #endregion

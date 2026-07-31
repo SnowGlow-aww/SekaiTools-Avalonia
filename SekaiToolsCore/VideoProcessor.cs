@@ -46,8 +46,9 @@ public enum ProcessStopReason
 
 public class VideoProcessor : IDisposable
 {
+    private readonly object _lifecycleGate = new();
+    private bool _disposed;
     private bool _debugIgnoreBannerMarker;
-    private volatile bool _isProcessing;
     private int _consecutiveExceptionCount;
     private const int ExceptionThreshold = 10;
 
@@ -59,6 +60,15 @@ public class VideoProcessor : IDisposable
     private const long CallbackThrottleMs = 200;
 
     public ProcessStopReason StopReason { get; private set; } = ProcessStopReason.None;
+
+    public bool IsProcessing
+    {
+        get
+        {
+            lock (_lifecycleGate)
+                return ProcessingTask is { IsCompleted: false };
+        }
+    }
 
     public VideoProcessor(Config config, VideoProcessCallbacks callbacks)
     {
@@ -73,7 +83,7 @@ public class VideoProcessor : IDisposable
         Callbacks = callbacks;
     }
 
-    private CancellationTokenSource? TokenSource { get; set; } = new();
+    private CancellationTokenSource? TokenSource { get; set; }
     private ContentTemplateMatcher? ContentMatcher { get; }
 
     private DialogTemplateMatcher? DialogMatcher { get; }
@@ -117,64 +127,122 @@ public class VideoProcessor : IDisposable
 
     public void StartProcess()
     {
-        if (ProcessingTask is { IsCompleted: false }) return;
+        lock (_lifecycleGate)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            // A VideoProcessor owns one VideoCapture and is intentionally single-use.
+            // Repeated calls while running or after completion must not replace the CTS
+            // underneath StopProcess/Dispose.
+            if (ProcessingTask != null) return;
+            if (Capture == null || Capture.Ptr == IntPtr.Zero)
+                throw new InvalidOperationException("VideoProcessor capture is not available.");
 
-        // 防止并发启动
-        if (_isProcessing) return;
+            TokenSource = new CancellationTokenSource();
+            var token = TokenSource.Token;
 
-        TokenSource?.Dispose();
-        TokenSource = new CancellationTokenSource();
-        var token = TokenSource.Token;
+            StopReason = ProcessStopReason.None;
+            _consecutiveExceptionCount = 0;
+            _lastProgressCallbackTime = 0;
+            _lastFpsCallbackTime = 0;
 
-        _isProcessing = true;
-        StopReason = ProcessStopReason.None;
-        _consecutiveExceptionCount = 0;
-        _lastProgressCallbackTime = 0;
-        _lastFpsCallbackTime = 0;
+            // Do not pass the cancellation token to Task.Run: if cancellation wins
+            // before scheduling, the delegate (and therefore native cleanup) would never run.
+            ProcessingTask = Task.Run(() => RunProcessing(token));
+        }
+    }
 
-        ProcessingTask = Task.Run(() =>
+    private void RunProcessing(CancellationToken token)
+    {
+        try
         {
             Callbacks.OnTaskStarted();
-            try
-            {
-                Process(token);
-            }
-            finally
-            {
-                _isProcessing = false;
-                Callbacks.OnTaskFinished();
-            }
-        }, token);
+            Process(token);
+        }
+        catch (OperationCanceledException)
+        {
+            StopReason = ProcessStopReason.Canceled;
+        }
+        catch (Exception ex)
+        {
+            if (StopReason == ProcessStopReason.None)
+                StopReason = ProcessStopReason.CaptureError;
+            try { Callbacks.OnException(ex); }
+            catch { /* A client callback must not prevent native cleanup. */ }
+        }
+        finally
+        {
+            try { Callbacks.OnTaskFinished(); }
+            catch { /* A client callback must not prevent native cleanup. */ }
+            CleanupNativeState();
+        }
     }
 
     public void StopProcess()
     {
-        TokenSource?.Cancel();
+        CancellationTokenSource? cancellation;
+        lock (_lifecycleGate)
+            cancellation = TokenSource;
+        try { cancellation?.Cancel(); }
+        catch (ObjectDisposedException) { }
     }
 
-    // Releases this run's native handles (video capture + cancellation source).
-    // SubtitleHandler calls this before starting the next run so repeated 打轴 in
-    // one session doesn't pile up VideoCapture file handles. Idempotent: Process()
-    // already disposes+nulls Capture on a normal finish.
+    // Cancel first, then wait briefly for the processing thread to leave native
+    // VideoCapture.Read. If the native call remains blocked, do not free the handle
+    // from this thread: RunProcessing owns deferred cleanup after the read returns.
     public void Dispose()
     {
-        TokenSource?.Cancel();
-        // 释放原生 Capture 前先等后台识别线程真正退出：Process 在另一线程持 capture 并发 Read，
-        // 句柄被并发释放会 use-after-free 崩溃。Dispose 由调度线程调用（非 ProcessingTask），
-        // 且必须在不持 SubtitleHandler 结果锁时调用，否则会与 OnNewDialog 抢锁死锁。
+        Task? processing;
+        CancellationTokenSource? cancellation;
+        lock (_lifecycleGate)
+        {
+            if (_disposed) return;
+            _disposed = true;
+            processing = ProcessingTask;
+            cancellation = TokenSource;
+        }
+
+        try { cancellation?.Cancel(); }
+        catch (ObjectDisposedException) { }
+
+        if (processing == null)
+        {
+            CleanupNativeState();
+            return;
+        }
+
+        // Dispose can be requested from a completion callback running on this task.
+        // Waiting on ourselves would deadlock; the finally block is about to clean up.
+        if (Task.CurrentId == processing.Id) return;
+
         try
         {
-            ProcessingTask?.Wait(TimeSpan.FromSeconds(10));
+            if (!processing.Wait(TimeSpan.FromSeconds(10)))
+                return;
         }
         catch
         {
-            // 后台任务异常已在 Process 内经回调上报；此处吞掉 Wait 抛出的聚合异常/取消。
+            // RunProcessing reports failures through callbacks and always cleans up.
         }
 
-        TokenSource?.Dispose();
-        TokenSource = null;
-        Capture?.Dispose();
-        Capture = null;
+        CleanupNativeState();
+    }
+
+    private void CleanupNativeState()
+    {
+        VideoCapture? capture;
+        CancellationTokenSource? cancellation;
+        lock (_lifecycleGate)
+        {
+            capture = Capture;
+            Capture = null;
+            cancellation = TokenSource;
+            TokenSource = null;
+        }
+
+        try { capture?.Dispose(); }
+        catch { /* Native cleanup is best-effort during shutdown. */ }
+        try { cancellation?.Dispose(); }
+        catch { }
     }
 
     private void Process(CancellationToken token)
@@ -361,9 +429,9 @@ public class VideoProcessor : IDisposable
         }
 
         frame.Dispose();
-        capture.Dispose();
-        if (ReferenceEquals(Capture, capture))
-            Capture = null;
+
+        // VideoCapture lifetime belongs to RunProcessing/CleanupNativeState. Keeping
+        // disposal out of Process also makes timeout disposal safe when Read is blocked.
 
         // 如果还未设置停止原因，则标记为完成
         if (StopReason == ProcessStopReason.None)

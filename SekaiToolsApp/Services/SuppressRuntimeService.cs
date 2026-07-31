@@ -20,7 +20,10 @@ public sealed record SuppressRuntimeDescriptor(
     SuppressBackend Backend,
     string FfmpegPath,
     string? VapourSynthPath = null,
-    string? VapourScriptPath = null);
+    string? VapourScriptPath = null,
+    string? FfprobePath = null);
+
+internal sealed record ExecutableValidation(bool IsValid, string Message, string Output = "");
 
 public sealed record SuppressRuntimeProbe(
     bool IsReady,
@@ -45,6 +48,14 @@ public static class SuppressRuntimeService
     private static readonly string[] VapourExecutableNames =
         OperatingSystem.IsWindows() ? ["VSPipe.exe"] : ["VSPipe", "vspipe"];
 
+    private static readonly string[] FfprobeExecutableNames =
+        OperatingSystem.IsWindows() ? ["ffprobe.exe", "ffprobe"] : ["ffprobe"];
+
+    private static readonly ConcurrentDictionary<string, ExecutableValidation> FfmpegValidationCache = new(
+        OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal);
+    private static readonly ConcurrentDictionary<string, ExecutableValidation> BasicValidationCache = new(
+        OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal);
+
     // preferFfmpeg：优先纯 ffmpeg 管线，机器上残留的 VapourSynth 只作兜底。
     // SekaiText 引擎（IPC）必须传 true——用户目录里老 SekaiTools 装的 VSPipe 版本不受
     // 我们控制，坏掉时 VSPipe 无输出、ffmpeg 只会报一句莫名其妙的
@@ -52,19 +63,32 @@ public static class SuppressRuntimeService
     // 拿不到我们随引擎发布的字体。Avalonia 桌面版保持默认 false（老行为）。
     public static SuppressRuntimeProbe Probe(string? ffmpegPathHint = null, bool preferFfmpeg = false)
     {
-        if (!preferFfmpeg && TryResolveVapourSynth(ffmpegPathHint, out var legacyDescriptor, out var legacyMessage))
-            return new SuppressRuntimeProbe(true, legacyMessage, legacyDescriptor);
+        var diagnostic = string.Empty;
+        if (!preferFfmpeg)
+        {
+            if (TryResolveVapourSynth(ffmpegPathHint, out var legacyDescriptor, out var legacyMessage))
+                return new SuppressRuntimeProbe(true, legacyMessage, legacyDescriptor);
+            diagnostic = legacyMessage;
+        }
 
         if (TryResolveFfmpeg(ffmpegPathHint, out var ffmpegPath, out var ffmpegMessage))
         {
             return new SuppressRuntimeProbe(true, ffmpegMessage,
-                new SuppressRuntimeDescriptor(SuppressBackend.Ffmpeg, ffmpegPath));
+                new SuppressRuntimeDescriptor(
+                    SuppressBackend.Ffmpeg,
+                    ffmpegPath,
+                    FfprobePath: ResolveFfprobe(ffmpegPath)));
+        }
+        diagnostic = ffmpegMessage;
+
+        if (preferFfmpeg)
+        {
+            if (TryResolveVapourSynth(ffmpegPathHint, out var fallbackDescriptor, out var fallbackMessage))
+                return new SuppressRuntimeProbe(true, fallbackMessage, fallbackDescriptor);
+            if (!string.IsNullOrWhiteSpace(fallbackMessage)) diagnostic = fallbackMessage;
         }
 
-        if (preferFfmpeg && TryResolveVapourSynth(ffmpegPathHint, out var fallbackDescriptor, out var fallbackMessage))
-            return new SuppressRuntimeProbe(true, fallbackMessage, fallbackDescriptor);
-
-        return new SuppressRuntimeProbe(false, BuildFailureMessage());
+        return new SuppressRuntimeProbe(false, BuildFailureMessage(diagnostic));
     }
 
     public static SuppressRuntimeDescriptor Resolve(string? ffmpegPathHint = null, bool preferFfmpeg = false)
@@ -108,12 +132,13 @@ public static class SuppressRuntimeService
 
     public static Task<EncoderProbeResult> ProbeEncodersDetailedAsync(string? ffmpegPathHint = null)
     {
-        if (!TryResolveFfmpeg(ffmpegPathHint, out var ffmpegPath, out _))
+        if (!TryResolveFfmpeg(ffmpegPathHint, out var ffmpegPath, out var failure))
             return Task.FromResult(new EncoderProbeResult(
-                [VideoEncoder.Libx264], new Dictionary<string, string>()));
+                [], new Dictionary<string, string> { [VideoEncoder.Libx264.ToString()] = failure }));
 
         // GetOrAdd 的 valueFactory 可能并发跑两次，但探测幂等、只是浪费几秒，无需加锁。
-        return EncoderProbeCache.GetOrAdd(ffmpegPath, ProbeEncodersUncachedAsync);
+        var cacheKey = ValidationCacheKey(ffmpegPath, "encoder-probe");
+        return EncoderProbeCache.GetOrAdd(cacheKey, _ => ProbeEncodersUncachedAsync(ffmpegPath));
     }
 
     private static async Task<EncoderProbeResult> ProbeEncodersUncachedAsync(string ffmpegPath)
@@ -122,32 +147,11 @@ public static class SuppressRuntimeService
         var available = new List<VideoEncoder> { VideoEncoder.Libx264 };
         var failures = new ConcurrentDictionary<string, string>();
 
-        string output;
-        try
-        {
-            var psi = new ProcessStartInfo(ffmpegPath)
-            {
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                UseShellExecute = false,
-                CreateNoWindow = true,
-            };
-            psi.ArgumentList.Add("-hide_banner");
-            psi.ArgumentList.Add("-nostdin");
-            psi.ArgumentList.Add("-encoders");
-
-            using var proc = Process.Start(psi);
-            if (proc == null) return new EncoderProbeResult(available, failures);
-
-            var stderrDrain = proc.StandardError.ReadToEndAsync();
-            output = await proc.StandardOutput.ReadToEndAsync();
-            await proc.WaitForExitAsync();
-            await stderrDrain;
-        }
-        catch
-        {
-            return new EncoderProbeResult(available, failures); // probe 失败不阻塞，保底 x264
-        }
+        var encoderList = await Task.Run(() =>
+            RunExecutable(ffmpegPath, ["-hide_banner", "-nostdin", "-encoders"], TimeSpan.FromSeconds(12)));
+        if (!encoderList.IsValid)
+            return new EncoderProbeResult(available, failures); // 已通过启动校验；瞬时失败不阻塞，保底 x264
+        var output = encoderList.Output;
 
         foreach (var (name, encoder) in SoftwareEncoderMap)
         {
@@ -349,7 +353,8 @@ public static class SuppressRuntimeService
         if (!TryResolveFfmpeg(ffmpegPathHint, out var ffmpegPath, out _))
             return Task.FromResult(new FontSubsystemCheck("skipped", 0, "未找到 ffmpeg，跳过检测"));
 
-        return FontCheckCache.GetOrAdd(ffmpegPath, FontCheckUncachedAsync);
+        var cacheKey = ValidationCacheKey(ffmpegPath, "font-check");
+        return FontCheckCache.GetOrAdd(cacheKey, _ => FontCheckUncachedAsync(ffmpegPath));
     }
 
     private static async Task<FontSubsystemCheck> FontCheckUncachedAsync(string ffmpegPath)
@@ -500,24 +505,36 @@ Dialogue: 0,0:00:00.00,0:00:00.20,System,,0,0,0,,Font subsystem check 123
         out string message)
     {
         descriptor = null;
-        message = string.Empty;
-
-        var vapourPath = ResolveExecutable(VapourExecutableNames);
+        var vapourPath = ResolveExecutable(
+            VapourExecutableNames,
+            null,
+            path => ValidateBasicExecutable(path, "--version"),
+            out var vapourFailure);
         if (vapourPath is null)
+        {
+            message = vapourFailure;
             return false;
+        }
 
         var scriptPath = ResolveScript();
         if (scriptPath is null)
+        {
+            message = "已找到 VSPipe，但未找到 lim5994.vpy 脚本。";
             return false;
+        }
 
-        if (!TryResolveFfmpeg(ffmpegPathHint, out var ffmpegPath, out _))
+        if (!TryResolveFfmpeg(ffmpegPathHint, out var ffmpegPath, out var ffmpegFailure))
+        {
+            message = ffmpegFailure;
             return false;
+        }
 
         descriptor = new SuppressRuntimeDescriptor(
             SuppressBackend.VapourSynth,
             ffmpegPath,
             vapourPath,
-            scriptPath);
+            scriptPath,
+            ResolveFfprobe(ffmpegPath));
         message = $"已检测到 VapourSynth 压制环境（{Path.GetFileName(vapourPath)} + ffmpeg）。";
         return true;
     }
@@ -527,28 +544,71 @@ Dialogue: 0,0:00:00.00,0:00:00.20,System,,0,0,0,,Font subsystem check 123
         out string ffmpegPath,
         out string message)
     {
-        ffmpegPath = ResolveExecutable(FfmpegExecutableNames, ffmpegPathHint) ?? string.Empty;
+        ffmpegPath = ResolveExecutable(
+                          FfmpegExecutableNames,
+                          ffmpegPathHint,
+                          ValidateFfmpegExecutable,
+                          out var failure)
+                      ?? string.Empty;
         if (string.IsNullOrWhiteSpace(ffmpegPath))
         {
-            message = string.Empty;
+            message = string.IsNullOrWhiteSpace(failure)
+                ? "未找到可执行的 ffmpeg。"
+                : failure;
             return false;
         }
 
-        message = $"已检测到 ffmpeg 压制环境（{ffmpegPath}）。";
+        message = $"已检测到 ffmpeg 压制环境（{ffmpegPath}，已验证 libx264 与 subtitles 滤镜）。";
         return true;
     }
 
-    private static string? ResolveExecutable(IEnumerable<string> candidateNames, string? configuredPath = null)
+    private static string? ResolveFfprobe(string ffmpegPath)
+    {
+        var directory = Path.GetDirectoryName(ffmpegPath);
+        var adjacent = directory is null
+            ? null
+            : Path.Combine(directory, OperatingSystem.IsWindows() ? "ffprobe.exe" : "ffprobe");
+        return ResolveExecutable(
+            FfprobeExecutableNames,
+            adjacent,
+            ValidateFfprobeExecutable,
+            out _);
+    }
+
+    private static string? ResolveExecutable(
+        IEnumerable<string> candidateNames,
+        string? configuredPath,
+        Func<string, ExecutableValidation> validate,
+        out string failure)
+    {
+        failure = string.Empty;
+        var seen = new HashSet<string>(
+            OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal);
+
+        foreach (var candidate in EnumerateExecutableCandidates(candidateNames, configuredPath))
+        {
+            if (!seen.Add(candidate)) continue;
+            var result = validate(candidate);
+            if (result.IsValid) return candidate;
+            failure = $"{candidate} 不可用：{result.Message}";
+        }
+
+        return null;
+    }
+
+    private static IEnumerable<string> EnumerateExecutableCandidates(
+        IEnumerable<string> candidateNames,
+        string? configuredPath)
     {
         if (!string.IsNullOrWhiteSpace(configuredPath))
         {
-            var full = Path.GetFullPath(configuredPath);
-            if (File.Exists(full))
-                return full;
+            string? full = null;
+            try { full = Path.GetFullPath(configuredPath); }
+            catch { /* 非法路径继续尝试 PATH。 */ }
+            if (full is not null && File.Exists(full)) yield return full;
 
-            var fromPath = FindOnPath(configuredPath);
-            if (fromPath is not null)
-                return fromPath;
+            foreach (var path in FindAllOnPath(configuredPath))
+                yield return path;
         }
 
         foreach (var candidate in candidateNames)
@@ -556,19 +616,132 @@ Dialogue: 0,0:00:00.00,0:00:00.20,System,,0,0,0,,Font subsystem check 123
             foreach (var root in SearchRoots())
             {
                 var path = Path.Combine(root, candidate);
-                if (File.Exists(path))
-                    return Path.GetFullPath(path);
+                if (File.Exists(path)) yield return Path.GetFullPath(path);
             }
         }
 
         foreach (var candidate in candidateNames)
         {
-            var path = FindOnPath(candidate);
-            if (path is not null)
-                return path;
+            foreach (var path in FindAllOnPath(candidate))
+                yield return path;
         }
+    }
 
-        return null;
+    private static ExecutableValidation ValidateFfmpegExecutable(string path)
+    {
+        var key = ValidationCacheKey(path, "ffmpeg-capabilities");
+        return FfmpegValidationCache.GetOrAdd(key, _ => ValidateFfmpegExecutableUncached(path));
+    }
+
+    private static ExecutableValidation ValidateFfmpegExecutableUncached(string path)
+    {
+        var version = RunExecutable(path, ["-hide_banner", "-version"], TimeSpan.FromSeconds(8));
+        if (!version.IsValid)
+            return version with { Message = "无法执行 ffmpeg：" + version.Message };
+
+        var encoders = RunExecutable(path, ["-hide_banner", "-encoders"], TimeSpan.FromSeconds(12));
+        if (!encoders.IsValid)
+            return encoders with { Message = "无法读取 ffmpeg 编码器列表：" + encoders.Message };
+        if (!encoders.Output.Contains("libx264", StringComparison.Ordinal))
+            return new ExecutableValidation(false, "该 ffmpeg 未编译 libx264，无法提供软件编码保底。");
+
+        var filters = RunExecutable(path, ["-hide_banner", "-filters"], TimeSpan.FromSeconds(12));
+        if (!filters.IsValid)
+            return filters with { Message = "无法读取 ffmpeg 滤镜列表：" + filters.Message };
+        if (!filters.Output.Contains("subtitles", StringComparison.Ordinal))
+            return new ExecutableValidation(false, "该 ffmpeg 未编译 subtitles/libass 滤镜，无法烧录字幕。");
+
+        return new ExecutableValidation(true, "ok", version.Output);
+    }
+
+    private static ExecutableValidation ValidateFfprobeExecutable(string path)
+    {
+        var key = ValidationCacheKey(path, "ffprobe-version");
+        return BasicValidationCache.GetOrAdd(key, _ =>
+        {
+            var result = RunExecutable(path, ["-hide_banner", "-version"], TimeSpan.FromSeconds(8));
+            if (!result.IsValid) return result;
+            if (!result.Output.Contains("ffprobe version", StringComparison.OrdinalIgnoreCase))
+                return new ExecutableValidation(false, "可执行文件未报告 ffprobe 版本标识。");
+            return result;
+        });
+    }
+
+    private static ExecutableValidation ValidateBasicExecutable(string path, string versionArgument)
+    {
+        var key = ValidationCacheKey(path, versionArgument);
+        return BasicValidationCache.GetOrAdd(key,
+            _ => RunExecutable(path, [versionArgument], TimeSpan.FromSeconds(8)));
+    }
+
+    private static string ValidationCacheKey(string path, string probe)
+    {
+        try
+        {
+            var info = new FileInfo(path);
+            return $"{Path.GetFullPath(path)}\n{info.Length}\n{info.LastWriteTimeUtc.Ticks}\n{probe}";
+        }
+        catch
+        {
+            return path + "\n" + probe;
+        }
+    }
+
+    private static ExecutableValidation RunExecutable(
+        string path,
+        IReadOnlyList<string> arguments,
+        TimeSpan timeout)
+    {
+        Process? process = null;
+        try
+        {
+            var startInfo = new ProcessStartInfo(path)
+            {
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+            };
+            foreach (var argument in arguments) startInfo.ArgumentList.Add(argument);
+
+            process = Process.Start(startInfo);
+            if (process is null)
+                return new ExecutableValidation(false, "进程启动返回空句柄。");
+
+            var stdout = process.StandardOutput.ReadToEndAsync();
+            var stderr = process.StandardError.ReadToEndAsync();
+            if (!process.WaitForExit((int)timeout.TotalMilliseconds))
+            {
+                KillQuiet(process);
+                try { process.WaitForExit(2000); } catch { /* ignored */ }
+                return new ExecutableValidation(false, $"执行超过 {timeout.TotalSeconds:0} 秒，已终止。");
+            }
+
+            Task.WaitAll([stdout, stderr], TimeSpan.FromSeconds(2));
+            var output = stdout.IsCompletedSuccessfully ? stdout.Result : string.Empty;
+            var error = stderr.IsCompletedSuccessfully ? stderr.Result : string.Empty;
+            var combined = output + Environment.NewLine + error;
+            if (process.ExitCode != 0)
+            {
+                var detail = combined
+                    .Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                    .FirstOrDefault() ?? "没有错误输出";
+                if (detail.Length > 240) detail = detail[..240];
+                return new ExecutableValidation(false, $"退出码 {process.ExitCode}：{detail}", combined);
+            }
+
+            return new ExecutableValidation(true, "ok", combined);
+        }
+        catch (Exception ex)
+        {
+            KillQuiet(process);
+            return new ExecutableValidation(false,
+                $"{ex.GetType().Name}: {ex.Message}（可能是文件不可执行或架构不兼容）");
+        }
+        finally
+        {
+            process?.Dispose();
+        }
     }
 
     private static string? ResolveScript()
@@ -598,14 +771,16 @@ Dialogue: 0,0:00:00.00,0:00:00.20,System,,0,0,0,,Font subsystem check 123
         yield return Path.Combine(ResourceManager.DataBaseDir, "Resource", "vapourSynth", "lim5994.vpy");
     }
 
-    private static string? FindOnPath(string command)
+    private static IEnumerable<string> FindAllOnPath(string command)
     {
         var pathEnv = Environment.GetEnvironmentVariable("PATH");
         if (string.IsNullOrWhiteSpace(pathEnv))
-            return null;
+            yield break;
 
-        var directories = pathEnv.Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
-        var candidates = ExpandPathCandidates(command);
+        var directories = pathEnv.Split(
+            Path.PathSeparator,
+            StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        var candidates = ExpandPathCandidates(command).ToArray();
 
         foreach (var directory in directories)
         {
@@ -613,11 +788,9 @@ Dialogue: 0,0:00:00.00,0:00:00.20,System,,0,0,0,,Font subsystem check 123
             {
                 var path = Path.Combine(directory, candidate);
                 if (File.Exists(path))
-                    return Path.GetFullPath(path);
+                    yield return Path.GetFullPath(path);
             }
         }
-
-        return null;
     }
 
     private static IEnumerable<string> ExpandPathCandidates(string command)
@@ -639,11 +812,14 @@ Dialogue: 0,0:00:00.00,0:00:00.20,System,,0,0,0,,Font subsystem check 123
         }
     }
 
-    private static string BuildFailureMessage()
+    private static string BuildFailureMessage(string? diagnostic)
     {
-        return
+        var message =
             "未找到可用的压制运行环境。\n" +
-            "请在设置里指定 ffmpeg 路径，或把 ffmpeg 放到 PATH。\n" +
+            "请在设置里指定可执行且包含 libx264 与 subtitles/libass 滤镜的 ffmpeg，或把它放到 PATH。\n" +
             "如果你已有 VapourSynth / VSPipe，也可以把它们放到应用目录或 PATH。";
+        return string.IsNullOrWhiteSpace(diagnostic)
+            ? message
+            : message + "\n检测详情：" + diagnostic;
     }
 }

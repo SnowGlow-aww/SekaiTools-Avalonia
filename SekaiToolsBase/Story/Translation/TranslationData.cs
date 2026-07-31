@@ -26,35 +26,12 @@ public class TranslationData
         return Translations.Count == 0;
     }
 
-    private int DialogCount()
-    {
-        return Translations.Count(translation => translation is DialogTranslate);
-    }
-
-    private int EffectCount()
-    {
-        return Translations.Count(translation => translation is EffectTranslate);
-    }
-
+    // 翻译文本来自不同团队和工作流，角色名、是否带全角冒号、行类型标记都可能
+    // 与日文 scenario 不一致。这些差异不能阻止载入；Story 会按现有行尽力套用，
+    // 缺失行保留原文，多余行忽略。保留此方法只是为了兼容旧调用方。
     public bool IsApplicable(GameScript.GameScript gameScript)
     {
-        if (gameScript.Empty()) return true;
-        if (IsEmpty()) return true;
-
-        if (DialogCount() != gameScript.TalkData.Length) return false;
-        if (EffectCount() != gameScript.SpecialEffectData.Length) return false;
-
-        for (var i = 0; i < gameScript.Snippets.Length; i++)
-            switch (gameScript.Snippets[i].Action)
-            {
-                case 1:
-                    if (Translations[i] is not DialogTranslate) return false;
-                    break;
-                case 6:
-                    if (Translations[i] is not EffectTranslate) return false;
-                    break;
-            }
-
+        _ = gameScript;
         return true;
     }
 }

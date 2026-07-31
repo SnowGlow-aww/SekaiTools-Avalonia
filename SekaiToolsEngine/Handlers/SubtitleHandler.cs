@@ -10,11 +10,13 @@ using SekaiToolsEngine.Ipc;
 
 namespace SekaiToolsEngine.Handlers;
 
-public sealed class SubtitleHandler
+public sealed class SubtitleHandler : IAsyncDisposable
 {
     private readonly IpcTransport _transport;
     private VideoProcessor? _processor;
+    private VideoProcessor? _retiringProcessor;
     private readonly object _lock = new();
+    private long _runGeneration;
     private readonly List<DialogBaseFrameSet> _dialogs = [];
     private readonly List<BannerBaseFrameSet> _banners = [];
     private readonly List<MarkerBaseFrameSet> _markers = [];
@@ -43,7 +45,7 @@ public sealed class SubtitleHandler
         dispatcher.Register("subtitle.frame", FrameAsync);
     }
 
-    private async Task<object?> StartAsync(JsonElement? @params)
+    private Task<object?> StartAsync(JsonElement? @params)
     {
         if (@params == null) throw new ArgumentException("params required");
         var p = @params.Value;
@@ -68,20 +70,38 @@ public sealed class SubtitleHandler
             };
         }
 
-        // 干净机器首跑：VideoProcessor 依赖 VideoProcess 模板/字体资源。尽力联网确保（Check + 按需下载），
-        // 但联网失败不阻断——只要本地已有资源（老用户/离线）仍可继续；真正缺失则在构造时给清晰错误。
-        try
-        {
-            await ResourceManager.Instance.EnsureResource(ResourceType.VideoProcess);
-        }
-        catch
-        {
-            // 拿文件清单/下载失败（多为离线）：忽略，改用本地已有资源继续。
-            // 若资源其实缺失，下面 new VideoProcessor 会抛出并转成清晰错误。
-        }
+        // VideoProcess 模板、字体与阈值清单随 SekaiCoreEngine 内置发布。启动时只做
+        // 本地 size/hash 校验，绝不联网下载；失败说明安装包不完整或文件已损坏。
+        if (!ResourceManager.Instance.CheckLocalResource(ResourceType.VideoProcess))
+            throw new InvalidOperationException(
+                "内置打轴模板/字体资源缺失或校验失败，请重新安装或更新 SekaiCoreEngine。");
 
         var config = new Config(videoPath, scriptPath, translatePath, matchingThreshold: threshold);
-        var callbacks = BuildCallbacks();
+
+        // Invalidate callbacks before stopping the old processor. Its native read may
+        // finish while teardown is in progress, but it can no longer append results or
+        // report completion for the replacement run.
+        VideoProcessor? previous;
+        long generation;
+        lock (_lock)
+        {
+            generation = ++_runGeneration;
+            previous = _processor ?? _retiringProcessor;
+            _processor = null;
+            _retiringProcessor = null;
+        }
+
+        previous?.StopProcess();
+        previous?.Dispose();
+        if (previous?.IsProcessing == true)
+        {
+            lock (_lock)
+            {
+                if (_runGeneration == generation)
+                    _retiringProcessor = previous;
+            }
+            throw new InvalidOperationException("上一段视频仍在等待原生解码读取退出，请稍后重试。");
+        }
 
         lock (_frameLock)
         {
@@ -91,21 +111,12 @@ public sealed class SubtitleHandler
             _videoPath = videoPath;
         }
 
-        // 先把上一段视频的 processor 摘出来在锁外停止并释放：Dispose 会等其识别线程结束，
-        // 而该线程的 OnNewDialog 回调要抢 _lock，若持锁等待会死锁。等旧线程真正退出后再清空
-        // 结果、建新任务，才能杜绝句柄被并发释放崩溃与旧对话串进本次结果。
-        VideoProcessor? previous;
+        VideoProcessor? processor = null;
         lock (_lock)
         {
-            previous = _processor;
-            _processor = null;
-        }
+            if (_runGeneration != generation)
+                throw new OperationCanceledException("字幕识别启动已被更新的请求取消。");
 
-        previous?.StopProcess();
-        previous?.Dispose(); // 释放上一段视频的 VideoCapture/Token 并等识别线程退出，避免连打多个视频时句柄堆积/并发释放
-
-        lock (_lock)
-        {
             _dialogs.Clear();
             _banners.Clear();
             _markers.Clear();
@@ -113,29 +124,23 @@ public sealed class SubtitleHandler
             TemplateMatchCachePool.ResetAll();
             try
             {
-                _processor = new VideoProcessor(config, callbacks);
+                processor = new VideoProcessor(config, BuildCallbacks(generation));
+                _processor = processor;
+                // StartProcess only schedules the long-running loop. Calling it against
+                // this local instance before returning ensures a following stop cannot be
+                // lost to a later fire-and-forget CTS replacement.
+                processor.StartProcess();
             }
-            catch (Exception ex)
+            catch
             {
-                throw new InvalidOperationException(
-                    $"打轴模板/字体资源缺失，且无法联网下载；请联网首次运行以下载 VideoProcess 资源：{ex.Message}", ex);
+                if (_runGeneration == generation)
+                    _processor = null;
+                processor?.Dispose();
+                throw;
             }
         }
 
-        // 刻意 fire-and-forget：start 语义是"立即回 ok 再后台流式跑"，不等长任务完成。
-        _ = Task.Run(() =>
-        {
-            try
-            {
-                _processor.StartProcess();
-            }
-            catch (Exception ex)
-            {
-                _transport.SendNotification("subtitle.error", new { message = ex.Message });
-            }
-        });
-
-        return "ok";
+        return Task.FromResult<object?>("ok");
     }
 
     private Task<object?> StopAsync(JsonElement? @params)
@@ -162,47 +167,48 @@ public sealed class SubtitleHandler
         }
         if (proc == null) throw new InvalidOperationException("No active processor");
 
-        foreach (var dialog in dialogs)
-            dialog.Data.BodyTranslated = dialog.Data.BodyTranslated.Replace("…", "...");
-
         var subtitle = proc.GenerateSubtitle(banners, dialogs, markers);
         return Task.FromResult<object?>(new { content = subtitle.ToString() });
     }
 
-    private VideoProcessCallbacks BuildCallbacks()
+    private VideoProcessCallbacks BuildCallbacks(long generation)
     {
         return new VideoProcessCallbacks
         {
             OnTaskStarted = () =>
             {
-                var cl = _processor?.ContentLength;
-                _transport.SendNotification("subtitle.started", new
+                lock (_lock)
                 {
-                    dialogTotal = cl?.Dialog ?? 0,
-                    bannerTotal = cl?.Banner ?? 0,
-                    markerTotal = cl?.Marker ?? 0,
-                });
+                    if (_runGeneration != generation) return;
+                    var cl = _processor?.ContentLength;
+                    _transport.SendNotification("subtitle.started", new
+                    {
+                        dialogTotal = cl?.Dialog ?? 0,
+                        bannerTotal = cl?.Banner ?? 0,
+                        markerTotal = cl?.Marker ?? 0,
+                    });
+                }
             },
             OnTaskFinished = () =>
             {
-                var reason = _processor?.StopReason.ToString() ?? "unknown";
-                _transport.SendNotification("subtitle.finished", new { reason });
+                lock (_lock)
+                {
+                    if (_runGeneration != generation) return;
+                    var reason = _processor?.StopReason.ToString() ?? "unknown";
+                    _transport.SendNotification("subtitle.finished", new { reason });
+                }
             },
             OnProgress = progress =>
-            {
-                _transport.SendNotification("subtitle.progress", new { percent = progress });
-            },
+                SendIfCurrent(generation, "subtitle.progress", new { percent = progress }),
             OnFps = (fps, eta) =>
-            {
-                _transport.SendNotification("subtitle.fps", new
+                SendIfCurrent(generation, "subtitle.fps", new
                 {
                     fps,
                     eta = eta.ToString(@"hh\:mm\:ss"),
-                });
-            },
+                }),
             OnFramePreviewImage = mat =>
             {
-                if (mat is null || mat.IsEmpty) return;
+                if (mat is null || mat.IsEmpty || !IsCurrent(generation)) return;
                 try
                 {
                     using var resized = new Mat();
@@ -211,48 +217,59 @@ public sealed class SubtitleHandler
                     using var buf = new Emgu.CV.Util.VectorOfByte();
                     CvInvoke.Imencode(".jpg", resized, buf,
                         new KeyValuePair<ImwriteFlags, int>(ImwriteFlags.JpegQuality, 50));
-                    _transport.SendNotification("subtitle.preview", new { base64 = Convert.ToBase64String(buf.ToArray()) });
+                    SendIfCurrent(generation, "subtitle.preview",
+                        new { base64 = Convert.ToBase64String(buf.ToArray()) });
                 }
                 catch { }
             },
             OnNewDialog = set =>
             {
-                int idx;
                 lock (_lock)
                 {
+                    if (_runGeneration != generation) return;
                     _dialogs.Add(set);
-                    idx = _dialogs.Count - 1;
+                    var idx = _dialogs.Count - 1;
+                    _transport.SendNotification("subtitle.dialog", SerializeDialog(set, idx));
                 }
-
-                _transport.SendNotification("subtitle.dialog", SerializeDialog(set, idx));
             },
             OnNewBanner = set =>
             {
-                int idx;
                 lock (_lock)
                 {
+                    if (_runGeneration != generation) return;
                     _banners.Add(set);
-                    idx = _banners.Count - 1;
+                    var idx = _banners.Count - 1;
+                    _transport.SendNotification("subtitle.banner", SerializeFrameSet(set, idx));
                 }
-
-                _transport.SendNotification("subtitle.banner", SerializeFrameSet(set, idx));
             },
             OnNewMarker = set =>
             {
-                int idx;
                 lock (_lock)
                 {
+                    if (_runGeneration != generation) return;
                     _markers.Add(set);
-                    idx = _markers.Count - 1;
+                    var idx = _markers.Count - 1;
+                    _transport.SendNotification("subtitle.marker", SerializeFrameSet(set, idx));
                 }
-
-                _transport.SendNotification("subtitle.marker", SerializeFrameSet(set, idx));
             },
             OnException = ex =>
-            {
-                _transport.SendNotification("subtitle.error", new { message = ex.Message });
-            },
+                SendIfCurrent(generation, "subtitle.error", new { message = ex.Message }),
         };
+    }
+
+    private bool IsCurrent(long generation)
+    {
+        lock (_lock)
+            return _runGeneration == generation;
+    }
+
+    private void SendIfCurrent(long generation, string method, object? payload)
+    {
+        lock (_lock)
+        {
+            if (_runGeneration != generation) return;
+            _transport.SendNotification(method, payload);
+        }
     }
 
     private static object SerializeDialog(DialogBaseFrameSet set, int index) => new
@@ -518,6 +535,36 @@ public sealed class SubtitleHandler
         if (index < 0 || index >= _banners.Count)
             throw new ArgumentException($"banner index 越界: {index} (共 {_banners.Count} 条)");
         return _banners[index];
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        VideoProcessor? current;
+        VideoProcessor? retiring;
+        lock (_lock)
+        {
+            ++_runGeneration;
+            current = _processor;
+            retiring = _retiringProcessor;
+            _processor = null;
+            _retiringProcessor = null;
+        }
+
+        lock (_frameLock)
+        {
+            _frameCapture?.Dispose();
+            _frameCapture = null;
+            _frameCapturePath = "";
+            _videoPath = "";
+        }
+
+        var processors = new[] { current, retiring }
+            .Where(processor => processor != null)
+            .Distinct()
+            .Cast<VideoProcessor>()
+            .ToArray();
+        foreach (var processor in processors) processor.StopProcess();
+        await Task.WhenAll(processors.Select(processor => Task.Run(processor.Dispose))).ConfigureAwait(false);
     }
 
     private static int RequireIndex(JsonElement p)

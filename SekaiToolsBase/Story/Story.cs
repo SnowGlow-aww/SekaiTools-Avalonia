@@ -72,18 +72,26 @@ public class Story
 
         Events = events.ToArray();
         if (translationData.IsEmpty()) return;
-        if (!translationData.IsApplicable(gameScript)) throw new Exception("Translation data is not applicable");
-        for (var i = 0; i < Events.Length; i++)
-            if (Events[i] is not DialogStoryEvent)
+
+        // 翻译文件不是 scenario 的强类型镜像：不同团队会使用不同角色命名，
+        // 也可能省略姓名/横幅行或带有额外行。按两边实际存在的行尽力套用；
+        // 类型不一致时只应用正文，绝不因命名或格式差异阻断打轴。
+        var translationCount = Math.Min(Events.Length, translationData.Translations.Count);
+        for (var i = 0; i < translationCount; i++)
+        {
+            var translation = translationData.Translations[i];
+            if (Events[i] is DialogStoryEvent dialog)
             {
-                Events[i].BodyTranslated = translationData.Translations[i].Body;
+                if (translation is DialogTranslate dialogTranslation)
+                    dialog.SetTranslation(dialogTranslation.Chara, dialogTranslation.Body);
+                else
+                    dialog.SetTranslationContent(translation.Body);
             }
             else
             {
-                var dialog = (DialogStoryEvent)Events[i];
-                dialog.SetTranslation(((DialogTranslate)translationData.Translations[i]).Chara,
-                    ((DialogTranslate)translationData.Translations[i]).Body);
+                Events[i].BodyTranslated = translation.Body;
             }
+        }
     }
 
     public static Story FromFile(string gameStoryDataPath, string translationDataPath = "")

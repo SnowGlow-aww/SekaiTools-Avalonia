@@ -25,7 +25,7 @@ namespace SekaiToolsApp.Views.Pages;
 /// <summary>
 /// 字幕生成主页 code-behind。
 /// </summary>
-public partial class SubtitlePageView : UserControl
+public partial class SubtitlePageView : UserControl, IAsyncDisposable
 {
     private static readonly string[] VideoExtensions = [".mp4", ".avi", ".mkv", ".webm", ".wmv"];
     private static readonly string[] ScriptExtensions = [".json", ".asset"];
@@ -34,12 +34,15 @@ public partial class SubtitlePageView : UserControl
     private readonly SubtitlePageViewModel _viewModel = new();
 
     private VideoProcessor? _videoProcessor;
+    private VideoProcessor? _retiringVideoProcessor;
+    private Task? _processorStartupTask;
     private WriteableBitmap? _previewBitmap;
     private DateTime _lastFpsRender = DateTime.MinValue;
     private bool _engineExceptionShown;
     private bool _stopRequested;
     private int _processSessionId;
     private string? _lastEngineExceptionMessage;
+    private volatile bool _disposed;
 
     public SubtitlePageView()
     {
@@ -270,7 +273,7 @@ public partial class SubtitlePageView : UserControl
 
     private async void OnStartClicked(object? sender, Avalonia.Interactivity.RoutedEventArgs e)
     {
-        if (_viewModel.IsRunning) return;
+        if (_disposed || _viewModel.IsRunning) return;
         if (!_viewModel.IsResourceReady)
         {
             await ShowErrorAsync("资源未就绪", "模板资源还没有准备完成，请等待资源检查/下载结束后再开始。");
@@ -310,22 +313,60 @@ public partial class SubtitlePageView : UserControl
         var sessionId = ++_processSessionId;
         _viewModel.RunState = SubtitleRunState.Running;
 
+        var previous = _videoProcessor ?? _retiringVideoProcessor;
+        _videoProcessor = null;
+        _retiringVideoProcessor = null;
+        if (previous != null)
+        {
+            await Task.Run(previous.Dispose);
+            if (previous.IsProcessing)
+            {
+                _retiringVideoProcessor = previous;
+                if (_disposed || sessionId != _processSessionId) return;
+                _viewModel.RunState = SubtitleRunState.Failed;
+                await ShowErrorAsync("上一任务仍在停止", "视频解码仍卡在原生读取中，请稍后重试；为避免并发释放导致崩溃，本次未启动新任务。");
+                return;
+            }
+        }
+        if (_disposed || sessionId != _processSessionId) return;
+
         // 重 IO / native 部分（VideoCapture、模板加载）放后台线程，避免：
         // 1) UI 线程被 native 调用阻塞；
         // 2) EmguCV / 视频解码异常未被托管 catch 时直接闪退。
         VideoProcessor? processor = null;
         Exception? constructError = null;
-        await Task.Run(() =>
+        var startupTask = Task.Run(() =>
         {
             try
             {
                 processor = new VideoProcessor(config, BuildCallbacks(sessionId));
+                if (_disposed || sessionId != Volatile.Read(ref _processSessionId))
+                {
+                    processor.Dispose();
+                    processor = null;
+                }
             }
             catch (Exception ex)
             {
                 constructError = ex;
             }
         });
+        _processorStartupTask = startupTask;
+        try
+        {
+            await startupTask;
+        }
+        finally
+        {
+            if (ReferenceEquals(_processorStartupTask, startupTask))
+                _processorStartupTask = null;
+        }
+
+        if (_disposed || sessionId != _processSessionId)
+        {
+            processor?.Dispose();
+            return;
+        }
 
         if (constructError != null || processor == null)
         {
@@ -347,6 +388,9 @@ public partial class SubtitlePageView : UserControl
         }
         catch (Exception ex)
         {
+            if (ReferenceEquals(_videoProcessor, processor))
+                _videoProcessor = null;
+            processor.Dispose();
             await ShowErrorAsync("无法启动", ex.Message);
             _viewModel.RunState = SubtitleRunState.Failed;
         }
@@ -459,7 +503,8 @@ public partial class SubtitlePageView : UserControl
             switch (card)
             {
                 case DialogLineCardViewModel dialog:
-                    dialog.Set.Data.BodyTranslated = dialog.Set.Data.BodyTranslated.Replace("…", "...");
+                    // SubtitleMaker clones and normalizes export data. Keep the live
+                    // editor model byte-for-byte unchanged by an export operation.
                     dialogFrameSets.Add(dialog.Set);
                     break;
                 case BannerLineCardViewModel banner:
@@ -476,9 +521,26 @@ public partial class SubtitlePageView : UserControl
 
     private void StopVideoProcessor(bool clearProcessor)
     {
-        try { _videoProcessor?.StopProcess(); }
-        catch { /* 静默：StopProcess 内部会取消 token，必要时 dispose capture，不应阻塞 UI */ }
+        var current = _videoProcessor;
         if (clearProcessor) _videoProcessor = null;
+        try { current?.StopProcess(); }
+        catch { /* 静默：StopProcess 只取消 token，不阻塞 UI。 */ }
+        if (clearProcessor && current != null)
+        {
+            _retiringVideoProcessor = current;
+            _ = Task.Run(() =>
+            {
+                current.Dispose();
+                if (!current.IsProcessing)
+                {
+                    Dispatcher.UIThread.Post(() =>
+                    {
+                        if (ReferenceEquals(_retiringVideoProcessor, current))
+                            _retiringVideoProcessor = null;
+                    });
+                }
+            });
+        }
     }
 
     #endregion
@@ -744,6 +806,7 @@ public partial class SubtitlePageView : UserControl
     {
         return Dispatcher.UIThread.InvokeAsync(() =>
         {
+            if (_disposed) return;
             _viewModel.ResourceState = state;
             _viewModel.ResourceStatusText = text;
         }).GetTask();
@@ -823,4 +886,29 @@ public partial class SubtitlePageView : UserControl
     }
 
     #endregion
+
+    public async ValueTask DisposeAsync()
+    {
+        if (_disposed) return;
+        _disposed = true;
+        _stopRequested = true;
+        ++_processSessionId;
+
+        var startup = _processorStartupTask;
+        if (startup != null)
+            await startup.ConfigureAwait(false);
+
+        var processors = new[] { _videoProcessor, _retiringVideoProcessor }
+            .Where(processor => processor != null)
+            .Distinct()
+            .Cast<VideoProcessor>()
+            .ToArray();
+        _videoProcessor = null;
+        _retiringVideoProcessor = null;
+        foreach (var processor in processors) processor.StopProcess();
+        await Task.WhenAll(processors.Select(processor => Task.Run(processor.Dispose)));
+
+        _previewBitmap?.Dispose();
+        _previewBitmap = null;
+    }
 }

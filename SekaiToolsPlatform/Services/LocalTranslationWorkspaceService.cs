@@ -24,11 +24,6 @@ public sealed class LocalTranslationWorkspaceService
         }
 
         var gameScript = new GameScript(scriptPath);
-        if (!translationData.IsApplicable(gameScript))
-        {
-            throw new InvalidOperationException("翻译数据不适用于此剧本");
-        }
-
         return new Story(gameScript, translationData);
     }
 

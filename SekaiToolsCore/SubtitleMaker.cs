@@ -31,13 +31,15 @@ public class SubtitleMaker(VideoInfo videoInfo, TemplateManager templateManager,
         List<BannerBaseFrameSet> bannerList,
         List<MarkerBaseFrameSet> markerList)
     {
+        // 导出会估算分隔帧，并为三行原文折叠译文换行；全部在副本上进行，避免改写编辑中的数据。
+        var exportDialogs = dialogList.Select(CloneDialogForExport).ToList();
         var events = new List<SubtitleEvent>();
 
-        if (dialogList.Count != 0)
+        if (exportDialogs.Count != 0)
         {
-            _nameTagPosition = dialogList[0].Frames[0].Point;
+            _nameTagPosition = exportDialogs[0].Frames[0].Point;
             _styles.AddRange(MakeDialogStyles());
-            events.AddRange(MakeDialogEvents(dialogList));
+            events.AddRange(MakeDialogEvents(exportDialogs));
         }
 
         if (bannerList.Count != 0)
@@ -69,6 +71,20 @@ public class SubtitleMaker(VideoInfo videoInfo, TemplateManager templateManager,
             new Styles(_styles.ToArray()),
             new Events(events.ToArray())
         );
+    }
+
+    internal static DialogBaseFrameSet CloneDialogForExport(DialogBaseFrameSet source)
+    {
+        var clone = new DialogBaseFrameSet((DialogStoryEvent)source.Data.Clone(), source.Fps)
+        {
+            Separate = source.Separate,
+            FirstProgress2Frame = source.FirstProgress2Frame,
+            FirstProgress3Frame = source.FirstProgress3Frame,
+            UseSeparator = source.UseSeparator,
+            Finished = source.Finished,
+        };
+        clone.Frames.AddRange(source.Frames);
+        return clone;
     }
 
     #region Dialog

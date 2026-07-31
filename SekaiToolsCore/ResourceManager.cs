@@ -1,6 +1,5 @@
 using System.Net;
 using System.Security.Cryptography;
-using System.Text;
 using System.Text.Json;
 using SekaiToolsBase;
 
@@ -75,12 +74,12 @@ public class ResourceManager
         };
     }
 
-    private async Task<HttpResponseMessage> Download(string url)
+    private async Task<string> DownloadStringAsync(string url)
     {
         using var client = new HttpClient(GetHttpHandler());
-        var response = await client.GetAsync(url);
+        using var response = await client.GetAsync(url, HttpCompletionOption.ResponseContentRead);
         response.EnsureSuccessStatusCode();
-        return response;
+        return await response.Content.ReadAsStringAsync();
     }
 
     public string ResourcePath(ResourceType type, string fileName)
@@ -88,11 +87,24 @@ public class ResourceManager
         if (!ResourceTypePathMap.TryGetValue(type, out var typeDir))
             throw new ArgumentException($"ResourceType {type} not mapped");
 
-        // 用户缓存优先（可能是联网下载的更新版），缺失则回退随包内置副本。
-        var cached = Path.Combine(BasePath, typeDir, fileName);
-        if (File.Exists(cached)) return cached;
-        var bundled = Path.Combine(BundledBasePath, typeDir, fileName);
-        if (File.Exists(bundled)) return bundled;
+        var manifestPath = $"{typeDir}/{fileName}";
+
+        // 用户缓存优先（可能是联网下载的更新版），但已加载清单时不能让损坏缓存遮住有效内置副本。
+        var cached = ResolveResourcePath(type, manifestPath, BasePath);
+        Resource? metadata = null;
+        lock (ResourceFileList)
+        {
+            if (ResourceFileList.TryGetValue(type, out var resources))
+            {
+                var match = resources.FirstOrDefault(resource =>
+                    string.Equals(resource.Path.Replace('\\', '/'), manifestPath, StringComparison.OrdinalIgnoreCase));
+                if (!string.IsNullOrWhiteSpace(match.Path)) metadata = match;
+            }
+        }
+        if (File.Exists(cached) && (metadata is null || ResourceFileValid(cached, metadata.Value))) return cached;
+
+        var bundled = ResolveResourcePath(type, manifestPath, BundledBasePath);
+        if (File.Exists(bundled) && (metadata is null || ResourceFileValid(bundled, metadata.Value))) return bundled;
         throw new FileNotFoundException($"{fileName} not found in cache ({cached}) or bundle ({bundled})");
     }
 
@@ -103,11 +115,37 @@ public class ResourceManager
         return fileList.All(file => CheckResourceFile(type, file));
     }
 
+    /// <summary>
+    /// 只使用随程序内置的清单校验本地缓存/内置资源，不进行任何网络请求。
+    /// VideoProcess 资源随 SekaiCoreEngine 发布，启动打轴时必须走此路径；缺失说明
+    /// 引擎包不完整或文件损坏，应重新安装，而不是要求用户联网补下载。
+    /// </summary>
+    public bool CheckLocalResource(ResourceType type)
+    {
+        if (!ResourceTypePathMap.TryGetValue(type, out var typeDir))
+            throw new ArgumentException($"ResourceType {type} not mapped");
+
+        var fileList = LoadBundledFileList(typeDir);
+        if (fileList.Length == 0) return false;
+        try
+        {
+            fileList = ValidateResourceList(type, fileList);
+        }
+        catch
+        {
+            return false;
+        }
+
+        lock (ResourceFileList)
+            ResourceFileList[type] = fileList;
+        return fileList.All(file => CheckResourceFile(type, file));
+    }
+
     private static bool CheckResourceFile(ResourceType type, Resource file)
     {
         // 用户缓存或随包内置任一处存在且 size+md5 匹配即视为就绪。
-        return ResourceFileValid(Path.Combine(BasePath, file.Path), file)
-               || ResourceFileValid(Path.Combine(BundledBasePath, file.Path), file);
+        return ResourceFileValid(ResolveResourcePath(type, file.Path, BasePath), file)
+               || ResourceFileValid(ResolveResourcePath(type, file.Path, BundledBasePath), file);
     }
 
     private static bool ResourceFileValid(string filename, Resource file)
@@ -115,27 +153,19 @@ public class ResourceManager
         filename = NormalizePath(filename);
         if (!File.Exists(filename)) return false;
         return file.Size == new FileInfo(filename).Length &&
-               string.Equals(file.Md5, CalculateMd5(filename), StringComparison.CurrentCultureIgnoreCase);
+               string.Equals(file.Md5, CalculateMd5(filename), StringComparison.OrdinalIgnoreCase);
     }
 
     private static string CalculateMd5(string filename)
     {
         using var md5 = MD5.Create();
-        // 使用 FileStream 打开文件，并传入到 ComputeHash 方法中
         using var stream = File.OpenRead(filename);
-        // 计算哈希值
-        var hashBytes = md5.ComputeHash(stream);
-
-        // 将字节数组转换为十六进制字符串
-        var sb = new StringBuilder();
-        foreach (var t in hashBytes) sb.Append(t.ToString("X2"));
-
-        return sb.ToString();
+        return Convert.ToHexString(md5.ComputeHash(stream));
     }
 
     public async Task EnsureResource(ResourceType type)
     {
-        if (!ResourceTypePathMap.TryGetValue(type, out var typeDir))
+        if (!ResourceTypePathMap.ContainsKey(type))
             throw new ArgumentException($"ResourceType {type} not mapped");
 
         var fileList = await GetFileList(type);
@@ -160,18 +190,204 @@ public class ResourceManager
         // 用户缓存或随包内置已就绪则无需联网——这是干净机器首跑的常态路径。
         if (CheckResourceFile(type, resource)) return;
 
-        var filename = NormalizePath(Path.Combine(BasePath, resource.Path));
-        var fileDir = Path.GetDirectoryName(filename);
-        if (fileDir != null && !Directory.Exists(fileDir)) Directory.CreateDirectory(fileDir);
+        var filename = ResolveResourcePath(type, resource.Path, BasePath);
+        var fileDir = Path.GetDirectoryName(filename)
+                      ?? throw new InvalidDataException($"Resource path has no parent directory: {resource.Path}");
+        Directory.CreateDirectory(fileDir);
 
-        if (File.Exists(filename)) File.Delete(filename);
-        var fileUrl = ResourceServerUrl + resource.Path;
-
+        var fileUrl = BuildResourceUrl(resource.Path);
         Console.WriteLine($"Downloading {fileUrl}");
-        var response = await Download(fileUrl);
-        var fileBytes = await response.Content.ReadAsByteArrayAsync();
-        await File.WriteAllBytesAsync(filename, fileBytes);
+
+        using var client = new HttpClient(GetHttpHandler());
+        using var response = await client.GetAsync(fileUrl, HttpCompletionOption.ResponseHeadersRead);
+        response.EnsureSuccessStatusCode();
+        if (response.Content.Headers.ContentLength is long contentLength && contentLength != resource.Size)
+            throw new InvalidDataException(
+                $"Resource size mismatch for {resource.Path}: expected {resource.Size}, server reported {contentLength}.");
+
+        await using var source = await response.Content.ReadAsStreamAsync();
+        await InstallVerifiedResourceAsync(
+            source,
+            filename,
+            resource,
+            containmentRoot: Path.Combine(BasePath, ResourceTypePathMap[type]));
         Console.WriteLine($"Download completed: {filename}");
+    }
+
+    internal static async Task InstallVerifiedResourceAsync(
+        Stream source,
+        string destination,
+        Resource resource,
+        CancellationToken cancellationToken = default,
+        string? containmentRoot = null)
+    {
+        ValidateSizeAndHash(resource);
+
+        var normalizedDestination = NormalizePath(destination);
+        var directory = Path.GetDirectoryName(normalizedDestination)
+                        ?? throw new InvalidDataException($"Resource destination has no parent directory: {destination}");
+        if (!string.IsNullOrWhiteSpace(containmentRoot))
+            EnsureNoReparsePoints(containmentRoot, normalizedDestination);
+        Directory.CreateDirectory(directory);
+        if (!string.IsNullOrWhiteSpace(containmentRoot))
+            EnsureNoReparsePoints(containmentRoot, normalizedDestination);
+
+        var temporary = Path.Combine(
+            directory,
+            $".{Path.GetFileName(normalizedDestination)}.{Guid.NewGuid():N}.tmp");
+
+        try
+        {
+            await using (var output = new FileStream(
+                             temporary,
+                             FileMode.CreateNew,
+                             FileAccess.Write,
+                             FileShare.None,
+                             81920,
+                             FileOptions.Asynchronous | FileOptions.SequentialScan))
+            {
+                var buffer = new byte[81920];
+                long written = 0;
+                while (true)
+                {
+                    var read = await source.ReadAsync(buffer.AsMemory(), cancellationToken);
+                    if (read == 0) break;
+                    if (written > resource.Size - read)
+                        throw new InvalidDataException(
+                            $"Resource size mismatch for {resource.Path}: expected {resource.Size}, download is larger.");
+                    await output.WriteAsync(buffer.AsMemory(0, read), cancellationToken);
+                    written += read;
+                }
+
+                if (written != resource.Size)
+                    throw new InvalidDataException(
+                        $"Resource size mismatch for {resource.Path}: expected {resource.Size}, downloaded {written}.");
+            }
+
+            if (!ResourceFileValid(temporary, resource))
+                throw new InvalidDataException($"Resource hash verification failed for {resource.Path}.");
+
+            // Re-check immediately before commit: a cache subdirectory must not
+            // have been replaced with a symlink/junction while bytes were downloading.
+            if (!string.IsNullOrWhiteSpace(containmentRoot))
+                EnsureNoReparsePoints(containmentRoot, normalizedDestination);
+
+            // 临时文件与目标位于同一目录；Move(overwrite) 在同卷上以一次替换提交，失败时保留旧缓存。
+            File.Move(temporary, normalizedDestination, true);
+        }
+        finally
+        {
+            if (File.Exists(temporary)) File.Delete(temporary);
+        }
+    }
+
+    internal static Resource[] ValidateResourceList(ResourceType type, IEnumerable<Resource> resources)
+    {
+        var validated = resources.ToArray();
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var resource in validated)
+        {
+            ValidateSizeAndHash(resource);
+            var canonical = ResolveResourcePath(type, resource.Path, BasePath);
+            if (!seen.Add(canonical))
+                throw new InvalidDataException($"Resource manifest contains duplicate path: {resource.Path}");
+        }
+
+        return validated;
+    }
+
+    internal static string ResolveResourcePath(ResourceType type, string manifestPath, string root)
+    {
+        if (!ResourceTypePathMap.TryGetValue(type, out var typeDir))
+            throw new ArgumentException($"ResourceType {type} not mapped");
+        if (string.IsNullOrWhiteSpace(manifestPath))
+            throw new InvalidDataException("Resource path is empty.");
+
+        var portablePath = manifestPath.Trim().Replace('\\', '/');
+        if (portablePath.StartsWith('/') || Path.IsPathRooted(portablePath))
+            throw new InvalidDataException($"Resource path must be relative: {manifestPath}");
+
+        var segments = portablePath.Split('/', StringSplitOptions.None);
+        if (segments.Length < 2 || !string.Equals(segments[0], typeDir, StringComparison.Ordinal))
+            throw new InvalidDataException(
+                $"Resource path must be inside the {typeDir} directory: {manifestPath}");
+        if (segments.Any(segment =>
+                segment.Length == 0 || segment is "." or ".." || segment.Contains(':') || segment.Any(char.IsControl)))
+            throw new InvalidDataException($"Resource path contains an invalid segment: {manifestPath}");
+
+        var normalizedRoot = NormalizePath(root);
+        var typeRoot = NormalizePath(Path.Combine(normalizedRoot, typeDir));
+        var candidate = NormalizePath(Path.Combine(normalizedRoot, Path.Combine(segments)));
+        var comparison = OperatingSystem.IsWindows()
+            ? StringComparison.OrdinalIgnoreCase
+            : StringComparison.Ordinal;
+        var prefix = typeRoot + Path.DirectorySeparatorChar;
+        if (!candidate.StartsWith(prefix, comparison))
+            throw new InvalidDataException($"Resource path escapes the {typeDir} directory: {manifestPath}");
+
+        EnsureNoReparsePoints(typeRoot, candidate);
+        return candidate;
+    }
+
+    internal static void EnsureNoReparsePoints(string containmentRoot, string candidate)
+    {
+        var root = NormalizePath(containmentRoot);
+        var target = NormalizePath(candidate);
+        var comparison = OperatingSystem.IsWindows()
+            ? StringComparison.OrdinalIgnoreCase
+            : StringComparison.Ordinal;
+        if (target != root && !target.StartsWith(root + Path.DirectorySeparatorChar, comparison))
+            throw new InvalidDataException($"Resource path escapes its containment root: {candidate}");
+
+        // Lexical containment is insufficient when an existing child directory
+        // is a Unix symlink or Windows junction. Inspect each existing component
+        // below (and including) the trusted type root; missing tail components are
+        // safe to create only after their nearest existing parent has passed.
+        var current = root;
+        RejectReparsePoint(current);
+        var relative = Path.GetRelativePath(root, target);
+        if (relative == ".") return;
+        foreach (var segment in relative.Split(
+                     Path.DirectorySeparatorChar,
+                     StringSplitOptions.RemoveEmptyEntries))
+        {
+            current = Path.Combine(current, segment);
+            RejectReparsePoint(current);
+        }
+    }
+
+    private static void RejectReparsePoint(string path)
+    {
+        try
+        {
+            if ((File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0)
+                throw new InvalidDataException($"Resource path traverses a symlink or junction: {path}");
+        }
+        catch (FileNotFoundException)
+        {
+            // The remaining path will be created beneath the verified parent.
+        }
+        catch (DirectoryNotFoundException)
+        {
+            // The remaining path will be created beneath the verified parent.
+        }
+    }
+
+    private static void ValidateSizeAndHash(Resource resource)
+    {
+        if (resource.Size < 0)
+            throw new InvalidDataException($"Resource size cannot be negative: {resource.Path}");
+        if (string.IsNullOrWhiteSpace(resource.Md5) ||
+            resource.Md5.Length != 32 ||
+            resource.Md5.Any(character => !Uri.IsHexDigit(character)))
+            throw new InvalidDataException($"Resource MD5 must contain exactly 32 hexadecimal characters: {resource.Path}");
+    }
+
+    private static string BuildResourceUrl(string manifestPath)
+    {
+        var escapedPath = string.Join('/', manifestPath.Trim().Replace('\\', '/').Split('/')
+            .Select(Uri.EscapeDataString));
+        return ResourceServerUrl + escapedPath;
     }
 
     private static string NormalizePath(string path)
@@ -182,7 +398,10 @@ public class ResourceManager
 
     private async Task<Resource[]> GetFileList(ResourceType type)
     {
-        if (ResourceFileList.TryGetValue(type, out var resources)) return resources;
+        lock (ResourceFileList)
+        {
+            if (ResourceFileList.TryGetValue(type, out var cachedResources)) return cachedResources;
+        }
 
         if (!ResourceTypePathMap.TryGetValue(type, out var typeDir))
             throw new ArgumentException($"ResourceType {type} not mapped");
@@ -194,18 +413,22 @@ public class ResourceManager
         {
             var fileListUrl = ResourceServerUrl + $"{typeDir}.json";
             Console.WriteLine($"Downloading {fileListUrl}");
-            var response = await Download(fileListUrl);
-            var fileListJson = await response.Content.ReadAsStringAsync();
+            var fileListJson = await DownloadStringAsync(fileListUrl);
             fileList = JsonSerializer.Deserialize<Resource[]>(fileListJson, new JsonSerializerOptions
             {
                 PropertyNameCaseInsensitive = true
             }) ?? [];
         }
 
-        if (fileList.Length > 0)
-            ResourceFileList[type] = fileList;
-        else
-            ResourceFileList.Remove(type);
+        fileList = ValidateResourceList(type, fileList);
+        lock (ResourceFileList)
+        {
+            if (fileList.Length > 0)
+                ResourceFileList[type] = fileList;
+            else
+                ResourceFileList.Remove(type);
+        }
+
         return fileList;
     }
 

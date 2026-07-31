@@ -30,6 +30,8 @@ public sealed class NavigationItem
 
     public string Tag { get; }
 
+    internal UserControl? CreatedContent => _content;
+
     public UserControl GetContent()
     {
         if (_content is not null) return _content;

@@ -35,11 +35,30 @@ Console.CancelKeyPress += (_, e) =>
     cts.Cancel();
 };
 
-while (!cts.Token.IsCancellationRequested)
+try
 {
-    var request = await transport.ReadRequestAsync(cts.Token);
-    if (request == null) break;
+    while (!cts.Token.IsCancellationRequested)
+    {
+        IpcRequest? request;
+        try
+        {
+            request = await transport.ReadRequestAsync(cts.Token);
+        }
+        catch (OperationCanceledException) when (cts.Token.IsCancellationRequested)
+        {
+            break;
+        }
 
-    var (result, error) = await dispatcher.DispatchAsync(request.Method, request.Params);
-    transport.SendResponse(request.Id, result, error);
+        if (request == null) break;
+
+        var (result, error) = await dispatcher.DispatchAsync(request.Method, request.Params);
+        transport.SendResponse(request.Id, result, error);
+    }
+}
+finally
+{
+    // stdin EOF, Ctrl+C, or an unexpected dispatcher failure must not orphan native
+    // VideoCapture work or ffmpeg/VSPipe process trees.
+    await suppressHandler.DisposeAsync();
+    await subtitleHandler.DisposeAsync();
 }

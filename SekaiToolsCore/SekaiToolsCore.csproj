@@ -28,4 +28,10 @@
         <ProjectReference Include="..\SekaiToolsBase\SekaiToolsBase.csproj"/>
     </ItemGroup>
 
+    <ItemGroup>
+        <AssemblyAttribute Include="System.Runtime.CompilerServices.InternalsVisibleToAttribute">
+            <_Parameter1>LineEditSelfTest</_Parameter1>
+        </AssemblyAttribute>
+    </ItemGroup>
+
 </Project>

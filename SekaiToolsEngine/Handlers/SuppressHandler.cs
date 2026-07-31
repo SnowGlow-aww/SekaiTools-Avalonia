@@ -5,13 +5,14 @@ using SekaiToolsEngine.Ipc;
 
 namespace SekaiToolsEngine.Handlers;
 
-public sealed class SuppressHandler
+public sealed class SuppressHandler : IAsyncDisposable
 {
     private readonly IpcTransport _transport;
     private readonly object _gate = new();
     private Suppressor? _suppressor;
     private bool _stopRequested;
     private int _progressFrames;
+    private long _runGeneration;
 
     public SuppressHandler(IpcTransport transport)
     {
@@ -25,7 +26,7 @@ public sealed class SuppressHandler
         dispatcher.Register("suppress.probe", ProbeAsync);
     }
 
-    private Task<object?> StartAsync(JsonElement? @params)
+    private async Task<object?> StartAsync(JsonElement? @params)
     {
         if (@params == null) throw new ArgumentException("params required");
         var p = @params.Value;
@@ -50,13 +51,32 @@ public sealed class SuppressHandler
             PreferFfmpegPipeline = true,
         };
 
+        // Reserve ownership before any asynchronous diagnostics or teardown. A newer
+        // start invalidates every callback from the previous run immediately.
+        Suppressor? previous;
+        long generation;
+        lock (_gate)
+        {
+            generation = ++_runGeneration;
+            _stopRequested = false;
+            _progressFrames = 0;
+            previous = _suppressor;
+            _suppressor = null;
+        }
+
+        if (previous != null)
+        {
+            try { await previous.StopAsync().ConfigureAwait(false); }
+            finally { previous.Dispose(); }
+        }
+
         // 环境概览进日志（引擎/系统/CPU/内存/显卡驱动/ffmpeg 版本）：真机故障排查
         // 全靠导出的日志，这里一次给全。每个任务开头打一遍（降级重试不重复）。
         foreach (var line in SystemEnvironmentInfo.DescribeLines())
-            _transport.SendNotification("suppress.log", new { line });
+            SendIfCurrent(generation, "suppress.log", new { line });
         var ffmpegDesc = DescribeFfmpegSafe(options.FfmpegPath);
         if (ffmpegDesc is not null)
-            _transport.SendNotification("suppress.log", new { line = "[Sekai] " + ffmpegDesc });
+            SendIfCurrent(generation, "suppress.log", new { line = "[Sekai] " + ffmpegDesc });
 
         // 字体子系统体检异步跑（进程内缓存，不阻塞启动）：健康机器亚秒出"正常"，
         // 病机的"检测超时"会赶在挂起 watchdog 裁决前后落进任务日志——导出的日志自带病灶结论。
@@ -65,7 +85,8 @@ public sealed class SuppressHandler
             try
             {
                 var fontCheck = await SuppressRuntimeService.ProbeFontSubsystemAsync(options.FfmpegPath);
-                _transport.SendNotification("suppress.log", new { line = "[Sekai] 字体子系统: " + fontCheck.Message });
+                SendIfCurrent(generation, "suppress.log",
+                    new { line = "[Sekai] 字体子系统: " + fontCheck.Message });
             }
             catch
             {
@@ -73,32 +94,57 @@ public sealed class SuppressHandler
             }
         });
 
-        lock (_gate)
+        var suppressor = new Suppressor(options, MakeCallbacks(options, attempt: 0, generation));
+        try
         {
-            _stopRequested = false;
-            _progressFrames = 0;
-            _suppressor?.Dispose();
-            _suppressor = new Suppressor(options, MakeCallbacks(options, attempt: 0));
-            _suppressor.Start();
+            lock (_gate)
+            {
+                if (_runGeneration != generation || _stopRequested)
+                    throw new OperationCanceledException("压制启动已被更新的请求取消。");
+
+                _suppressor = suppressor;
+                suppressor.Start();
+            }
+        }
+        catch
+        {
+            lock (_gate)
+            {
+                if (ReferenceEquals(_suppressor, suppressor))
+                    _suppressor = null;
+                if (_runGeneration == generation)
+                {
+                    ++_runGeneration;
+                    _stopRequested = true;
+                }
+            }
+            suppressor.Dispose();
+            throw;
         }
 
-        return Task.FromResult<object?>("ok");
+        return "ok";
     }
 
-    private SuppressorCallbacks MakeCallbacks(SuppressorOptions options, int attempt)
+    private SuppressorCallbacks MakeCallbacks(SuppressorOptions options, int attempt, long generation)
     {
         return new SuppressorCallbacks
         {
-            OnStarted = () => _transport.SendNotification("suppress.started", null),
-            OnLogLine = line => _transport.SendNotification("suppress.log", new { line }),
-            OnProgressLogLine = line => _transport.SendNotification("suppress.progressLog", new { line }),
+            OnStarted = () => SendIfCurrent(generation, "suppress.started", null),
+            OnLogLine = line => SendIfCurrent(generation, "suppress.log", new { line }),
+            OnProgressLogLine = line => SendIfCurrent(generation, "suppress.progressLog", new { line }),
             OnProgress = (frame, total, fps) =>
             {
-                if (frame > 0) Interlocked.Exchange(ref _progressFrames, frame);
-                _transport.SendNotification("suppress.progress", new { frame, total, fps });
+                lock (_gate)
+                {
+                    if (_runGeneration != generation) return;
+                    if (frame > 0) _progressFrames = frame;
+                    _transport.SendNotification("suppress.progress", new { frame, total, fps });
+                }
             },
             OnFinished = (reason, ex) =>
             {
+                if (!IsCurrent(generation)) return;
+
                 // 普通失败仍只在起步零帧时降级；保留对“有可靠正面证据的中途挂起”
                 // 异常的恢复能力。静默 watchdog 不再仅凭进度/文件大小不变创建该异常，
                 // 因为这种旁路信号在真机上会误杀健康的 QSV 与 x264。用户主动取消不重试。
@@ -108,10 +154,10 @@ public sealed class SuppressHandler
                 };
                 if (reason == SuppressorStopReason.Failed
                     && (Volatile.Read(ref _progressFrames) == 0 || midRunHang)
-                    && TryStartFallback(options, ex, attempt))
+                    && TryStartFallback(options, ex, attempt, generation))
                     return;
 
-                _transport.SendNotification("suppress.finished",
+                SendIfCurrent(generation, "suppress.finished",
                     new { reason = reason.ToString(), error = ex?.Message });
             },
         };
@@ -129,7 +175,7 @@ public sealed class SuppressHandler
     ///    驱动暂时性故障；或关硬解后仍挂起）→ x264 软编 + 软件解码，宁可慢不白挂。
     /// 已是全软还失败 → 不再重试（重跑同样的东西没有意义）。
     /// </summary>
-    private bool TryStartFallback(SuppressorOptions failed, Exception? ex, int attempt)
+    private bool TryStartFallback(SuppressorOptions failed, Exception? ex, int attempt, long generation)
     {
         if (attempt >= 2) return false;
 
@@ -170,21 +216,35 @@ public sealed class SuppressHandler
 
         lock (_gate)
         {
-            if (_stopRequested) return false;
-            _transport.SendNotification("suppress.log", new { line = logLine });
+            if (_runGeneration != generation || _stopRequested) return false;
+
+            // Each fallback is a distinct owned attempt. Incrementing the generation
+            // makes late stdout/progress/finished callbacks from the failed process stale.
+            var fallbackGeneration = ++_runGeneration;
+            var completed = _suppressor;
+            var replacement = new Suppressor(
+                fallback,
+                MakeCallbacks(fallback, attempt + 1, fallbackGeneration));
+            _suppressor = replacement;
+
             try
             {
+                _transport.SendNotification("suppress.log", new { line = logLine });
                 // 中途挂起的静默估算进度属于上一轮；必须在新一轮启动前清零，
                 // 否则重试若又起步失败，会被误判成“已经出过帧”而挡住后续降级。
-                Interlocked.Exchange(ref _progressFrames, 0);
+                _progressFrames = 0;
                 _transport.SendNotification("suppress.progress", new { frame = 0, total = 0, fps = 0.0 });
-                _suppressor?.Dispose();
-                _suppressor = new Suppressor(fallback, MakeCallbacks(fallback, attempt + 1));
-                _suppressor.Start();
+                replacement.Start();
+                // The completed Suppressor performs terminal cleanup immediately after
+                // this callback returns. Do not dispose it from inside its own callback.
                 return true;
             }
             catch (Exception startEx)
             {
+                if (ReferenceEquals(_suppressor, replacement))
+                    _suppressor = completed;
+                _runGeneration = generation;
+                replacement.Dispose();
                 _transport.SendNotification("suppress.log",
                     new { line = "[Sekai] 降级重试启动失败：" + startEx.Message });
                 return false;
@@ -225,6 +285,21 @@ public sealed class SuppressHandler
         }
     }
 
+    private bool IsCurrent(long generation)
+    {
+        lock (_gate)
+            return _runGeneration == generation;
+    }
+
+    private void SendIfCurrent(long generation, string method, object? payload)
+    {
+        lock (_gate)
+        {
+            if (_runGeneration != generation) return;
+            _transport.SendNotification(method, payload);
+        }
+    }
+
     private async Task<object?> StopAsync(JsonElement? @params)
     {
         Suppressor? current;
@@ -237,6 +312,28 @@ public sealed class SuppressHandler
         if (current != null)
             await current.StopAsync();
         return "ok";
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        Suppressor? current;
+        lock (_gate)
+        {
+            ++_runGeneration;
+            _stopRequested = true;
+            current = _suppressor;
+            _suppressor = null;
+        }
+
+        if (current == null) return;
+        try
+        {
+            await current.StopAsync().ConfigureAwait(false);
+        }
+        finally
+        {
+            current.Dispose();
+        }
     }
 
     private async Task<object?> ProbeAsync(JsonElement? @params)

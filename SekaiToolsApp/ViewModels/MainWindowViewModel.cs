@@ -1,5 +1,7 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
 using Avalonia.Controls;
 using CommunityToolkit.Mvvm.ComponentModel;
 using FluentAvalonia.UI.Controls;
@@ -7,7 +9,7 @@ using SekaiToolsApp.Views.Pages;
 
 namespace SekaiToolsApp.ViewModels;
 
-public partial class MainWindowViewModel : ViewModelBase
+public partial class MainWindowViewModel : ViewModelBase, IAsyncDisposable
 {
     public MainWindowViewModel()
     {
@@ -51,6 +53,22 @@ public partial class MainWindowViewModel : ViewModelBase
                 value?.Title ?? "页面加载失败",
                 "页面在初始化时发生异常。",
                 ex.Message);
+        }
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        foreach (var item in MenuItems.Concat(FooterMenuItems))
+        {
+            switch (item.CreatedContent)
+            {
+                case IAsyncDisposable asyncDisposable:
+                    await asyncDisposable.DisposeAsync();
+                    break;
+                case IDisposable disposable:
+                    disposable.Dispose();
+                    break;
+            }
         }
     }
 }

@@ -4,11 +4,10 @@ using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Text;
+using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
-using Emgu.CV;
-using Emgu.CV.CvEnum;
 
 namespace SekaiToolsApp.Services;
 
@@ -109,6 +108,8 @@ public sealed partial class Suppressor : IDisposable
     private Task? _vLogTask;
     private Task? _stdoutTask;
     private Task? _progressTask;
+    private Task? _frameProbeTask;
+    private Task? _completionTask;
     private CancellationTokenSource? _cts;
     // ffmpeg 的 -progress 机读输出走独立临时文件，不再走 stdout pipe。真机实证：
     // 某些 Windows 安全软件/注入环境会让重定向 stdout 与 stderr 的周期输出双双消失，
@@ -120,14 +121,15 @@ public sealed partial class Suppressor : IDisposable
     private double _durationSec;
     // 从视频流 "N fps" 解析一次：仅当 EmguCV 拿不到帧数时，用 时长×帧率 兜底估算总帧数。
     private double _sourceFps;
-    // EmguCV 探帧结果：>0=成功；0=未完成/失败（ResolveTotalFrames 用 时长×帧率 兜底）。
-    // 探测只在 StartFrameProbe 的独立后台线程跑：真机实证（Windows+QSV 报告者，2.3.3）
-    // VideoCapture 对部分视频/环境会无限挂死（MSMF）或抛非 IO 异常——旧版在进度读线程上
-    // 同步探帧，首个 tick 即卡死/线程死亡 → 机读通道全灭、完成/取消也被 await 卡住。
-    // 任何读取线程永远不许碰 EmguCV。
+    // ffprobe 探帧结果：>0=成功；0=未完成/失败（ResolveTotalFrames 用 时长×帧率 兜底）。
+    // 探测使用可取消、限时的外部进程，避免 EmguCV/MediaFoundation 永久挂死时泄漏后台线程与 native 状态。
     private volatile int _probedFrameCount;
     // -progress 机读通道收到的行数（watchdog 诊断用）。
     private int _pgLineCount;
+    // Only positive frame/out-time advancement counts as startup progress. A
+    // malformed line or a single frame=0 block must not permanently disarm the
+    // hang watchdog.
+    private int _progressEvidence;
     private bool _lastLogLineWasProgress;
     // -progress 机读进度块的累积值（进度文件读取线程独占写入，progress= 行收束上报）。
     private int _pgFrame;
@@ -140,6 +142,7 @@ public sealed partial class Suppressor : IDisposable
     // 挂起的具体判词与阶段，随异常带给上层与日志。
     private volatile string? _hangReason;
     private volatile SuppressPipelineHangStage _hangStage;
+    private int _suppressCompletionCallback;
     private int _disposed;
 
     public Suppressor(SuppressorOptions options, SuppressorCallbacks callbacks)
@@ -160,47 +163,63 @@ public sealed partial class Suppressor : IDisposable
     /// </summary>
     public void Start()
     {
+        if (Volatile.Read(ref _disposed) != 0)
+            throw new ObjectDisposedException(nameof(Suppressor));
         if (IsRunning)
             throw new InvalidOperationException("Suppressor 已经在运行。");
 
         EnsureSourceExists();
 
-        _runtime = SuppressRuntimeService.Resolve(_options.FfmpegPath, _options.PreferFfmpegPipeline);
-
-        _frameCount = 0;
-        _fps = 0;
-        _durationSec = 0;
-        _sourceFps = 0;
-        _probedFrameCount = 0;
-        _pgLineCount = 0;
-        _lastLogLineWasProgress = false;
-        _pgFrame = 0;
-        _pgFps = 0;
-        _pgOutTimeSec = -1;
-        _sawStderrProgress = false;
-        _hangAborted = false;
-        _hangReason = null;
-        _hangStage = SuppressPipelineHangStage.Startup;
-        _cts = new CancellationTokenSource();
-        _progressFilePath = Path.Combine(Path.GetTempPath(),
-            $"sekai-suppress-progress-{Environment.ProcessId}-{Guid.NewGuid():N}.log");
-        StartFrameProbe();
-
-        switch (_runtime.Backend)
+        var startupCommitted = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        try
         {
-            case SuppressBackend.VapourSynth:
-                StartLegacyPipeline();
-                break;
-            case SuppressBackend.Ffmpeg:
-                StartFfmpegPipeline();
-                break;
-            default:
-                throw new InvalidOperationException($"未知压制后端：{_runtime.Backend}");
-        }
+            _runtime = SuppressRuntimeService.Resolve(_options.FfmpegPath, _options.PreferFfmpegPipeline);
 
-        _callbacks.OnStarted?.Invoke();
-        StartProgressWatchdog();
-        _ = Task.Run(WaitForExitAsync);
+            _frameCount = 0;
+            _fps = 0;
+            _durationSec = 0;
+            _sourceFps = 0;
+            _probedFrameCount = 0;
+            _pgLineCount = 0;
+            _progressEvidence = 0;
+            _lastLogLineWasProgress = false;
+            _pgFrame = 0;
+            _pgFps = 0;
+            _pgOutTimeSec = -1;
+            _sawStderrProgress = false;
+            _hangAborted = false;
+            _hangReason = null;
+            _hangStage = SuppressPipelineHangStage.Startup;
+            Volatile.Write(ref _suppressCompletionCallback, 0);
+            _cts = new CancellationTokenSource();
+            _progressFilePath = Path.Combine(Path.GetTempPath(),
+                $"sekai-suppress-progress-{Environment.ProcessId}-{Guid.NewGuid():N}.log");
+            StartFrameProbe();
+
+            switch (_runtime.Backend)
+            {
+                case SuppressBackend.VapourSynth:
+                    StartLegacyPipeline();
+                    break;
+                case SuppressBackend.Ffmpeg:
+                    StartFfmpegPipeline();
+                    break;
+                default:
+                    throw new InvalidOperationException($"未知压制后端：{_runtime.Backend}");
+            }
+
+            // 先挂上退出监控，再调用外部回调。即使 OnStarted 抛错，catch 也会终止、等待并释放已启动进程。
+            _completionTask = Task.Run(() => WaitForExitAsync(startupCommitted.Task));
+            StartProgressWatchdog();
+            _callbacks.OnStarted?.Invoke();
+            startupCommitted.TrySetResult(true);
+        }
+        catch
+        {
+            startupCommitted.TrySetResult(false);
+            AbortFailedStart();
+            throw;
+        }
     }
 
     /// <summary>
@@ -259,14 +278,20 @@ public sealed partial class Suppressor : IDisposable
 
         try
         {
-            // 限时等待：读线程已不做任何可挂死的调用（探帧移到了独立线程），此处限时只是保险——
-            // 取消绝不允许被进度线程拖死（否则 suppress.stop RPC 永不返回）。
+            // 限时等待：进度读取只做文件/管道 IO；取消绝不允许被异常环境拖死。
             if (_progressTask != null)
                 await Task.WhenAny(_progressTask, Task.Delay(3000)).ConfigureAwait(false);
         }
         catch
         {
             // 同上。
+        }
+
+        var completion = _completionTask;
+        if (completion is not null)
+        {
+            try { await Task.WhenAny(completion, Task.Delay(5000)).ConfigureAwait(false); }
+            catch { /* WaitForExitAsync 会自行报告并清理。 */ }
         }
     }
 
@@ -317,7 +342,7 @@ public sealed partial class Suppressor : IDisposable
         _callbacks.OnLogLine?.Invoke($"[Sekai] {name} 命令行: {process.StartInfo.FileName} {args}");
     }
 
-    private async Task WaitForExitAsync()
+    private async Task WaitForExitAsync(Task<bool> startupCommitted)
     {
         Exception? failure = null;
         var canceled = false;
@@ -421,7 +446,16 @@ public sealed partial class Suppressor : IDisposable
             : canceled ? SuppressorStopReason.Canceled
             : SuppressorStopReason.Completed;
 
-        _callbacks.OnFinished?.Invoke(reason, failure);
+        try
+        {
+            if (await startupCommitted.ConfigureAwait(false) &&
+                Volatile.Read(ref _suppressCompletionCallback) == 0)
+                _callbacks.OnFinished?.Invoke(reason, failure);
+        }
+        finally
+        {
+            CleanupTerminalState(terminateProcesses: false);
+        }
     }
 
     private Exception? BuildExitFailure()
@@ -674,11 +708,15 @@ public sealed partial class Suppressor : IDisposable
         if (eq <= 0) return;
         var key = line[..eq];
         var val = line[(eq + 1)..].Trim();
+        if (ProgressValueShowsAdvancement(key, val))
+            Interlocked.Exchange(ref _progressEvidence, 1);
         switch (key)
         {
             case "frame":
                 if (int.TryParse(val, NumberStyles.Integer, CultureInfo.InvariantCulture, out var f))
+                {
                     _pgFrame = f;
+                }
                 break;
             case "fps":
                 if (double.TryParse(val, NumberStyles.Float, CultureInfo.InvariantCulture, out var fp) && fp > 0)
@@ -686,7 +724,9 @@ public sealed partial class Suppressor : IDisposable
                 break;
             case "out_time": // 编码初期为 N/A，解析失败即维持旧值
                 if (TryParseFfmpegTime(val, out var sec))
+                {
                     _pgOutTimeSec = sec;
+                }
                 break;
             case "progress": // continue/end 都收束一次上报
                 EmitProgressTick();
@@ -782,6 +822,7 @@ public sealed partial class Suppressor : IDisposable
 
             _lastLogLineWasProgress = true;
             _sawStderrProgress = true;
+            if (frameNumber > 0) Interlocked.Exchange(ref _progressEvidence, 1);
 
             var total = ResolveTotalFrames();
 
@@ -793,6 +834,7 @@ public sealed partial class Suppressor : IDisposable
             if (_durationSec > 0 && total > 0 && timeMatch.Success &&
                 TryParseFfmpegTime(timeMatch.Groups["Time"].Value, out var outTimeSec))
             {
+                if (outTimeSec > 0) Interlocked.Exchange(ref _progressEvidence, 1);
                 var ratio = Math.Clamp(outTimeSec / _durationSec, 0, 1);
                 reported = (int)Math.Round(ratio * total);
             }
@@ -843,9 +885,8 @@ public sealed partial class Suppressor : IDisposable
         return 0;
     }
 
-    /// <summary>EmguCV 帧数探测，Start 时在独立后台线程跑一次。挂死(真机实证 Windows MSMF
-    /// 会无限 hang)只泄漏一条后台线程，进度走兜底口径不受影响；抛异常同理。
-    /// SEKAI_DEBUG_PROBE_HANG / SEKAI_DEBUG_PROBE_THROW 环境变量供自测复刻这两种故障。</summary>
+    /// <summary>用 ffprobe 在独立子进程中读取容器帧数。探测限时十秒，取消、超时或异常时
+    /// 强制回收整个进程树；不再使用可能永久挂死且无法取消的 EmguCV native 线程。</summary>
     private void StartFrameProbe()
     {
         if (_options.SourceFrameCount > 0)
@@ -854,32 +895,135 @@ public sealed partial class Suppressor : IDisposable
             return;
         }
 
-        var video = _options.SourceVideo;
-        var thread = new Thread(() =>
+        var ffprobe = _runtime?.FfprobePath;
+        var token = _cts?.Token ?? CancellationToken.None;
+        if (string.IsNullOrWhiteSpace(ffprobe) || string.IsNullOrWhiteSpace(_options.SourceVideo)) return;
+
+        _frameProbeTask = Task.Run(() => ProbeFrameCountAsync(ffprobe, _options.SourceVideo, token));
+    }
+
+    private async Task ProbeFrameCountAsync(string ffprobePath, string videoPath, CancellationToken token)
+    {
+        Process? process = null;
+        try
         {
+            var startInfo = new ProcessStartInfo(ffprobePath)
+            {
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+            };
+            startInfo.ArgumentList.Add("-v");
+            startInfo.ArgumentList.Add("error");
+            startInfo.ArgumentList.Add("-select_streams");
+            startInfo.ArgumentList.Add("v:0");
+            startInfo.ArgumentList.Add("-show_entries");
+            startInfo.ArgumentList.Add("stream=nb_frames,avg_frame_rate,duration:format=duration");
+            startInfo.ArgumentList.Add("-of");
+            startInfo.ArgumentList.Add("json");
+            startInfo.ArgumentList.Add(videoPath);
+
+            process = Process.Start(startInfo);
+            if (process is null) return;
+
+            var stdout = process.StandardOutput.ReadToEndAsync();
+            var stderr = process.StandardError.ReadToEndAsync();
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(token);
+            timeout.CancelAfter(TimeSpan.FromSeconds(10));
             try
             {
-                if (Environment.GetEnvironmentVariable("SEKAI_DEBUG_PROBE_HANG") == "1")
-                    Thread.Sleep(Timeout.Infinite);
-                if (Environment.GetEnvironmentVariable("SEKAI_DEBUG_PROBE_THROW") == "1")
-                    throw new InvalidOperationException("SEKAI_DEBUG_PROBE_THROW");
-                if (string.IsNullOrEmpty(video) || !File.Exists(video)) return;
-
-                using var capture = new VideoCapture(video);
-                var probed = (int)capture.Get(CapProp.FrameCount);
-                if (probed > 0)
-                {
-                    // 回填 options：软编自动重试(SuppressHandler)复用同一份探测结果。
-                    _options.SourceFrameCount = probed;
-                    _probedFrameCount = probed;
-                }
+                await process.WaitForExitAsync(timeout.Token).ConfigureAwait(false);
             }
-            catch
+            catch (OperationCanceledException)
             {
-                // 探测失败 → 兜底口径，进度不受影响。
+                TryKill(process);
+                try { await process.WaitForExitAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(2)); }
+                catch { /* 已强杀，句柄稍后统一释放。 */ }
+                return;
             }
-        }) { IsBackground = true, Name = "suppress-frame-probe" };
-        thread.Start();
+
+            var output = await stdout.ConfigureAwait(false);
+            await stderr.ConfigureAwait(false);
+            if (process.ExitCode != 0 || token.IsCancellationRequested) return;
+
+            var probed = ParseFrameProbe(output);
+            if (probed <= 0) return;
+
+            // 回填 options：软编自动重试(SuppressHandler)复用同一份探测结果。
+            _options.SourceFrameCount = probed;
+            _probedFrameCount = probed;
+        }
+        catch
+        {
+            TryKill(process);
+            // 探测失败 → 运行时继续用 ffmpeg 时长×帧率兜底，压制本身不受影响。
+        }
+        finally
+        {
+            TryKill(process);
+            process?.Dispose();
+        }
+    }
+
+    internal static int ParseFrameProbe(string json)
+    {
+        try
+        {
+            using var document = JsonDocument.Parse(json);
+            if (!document.RootElement.TryGetProperty("streams", out var streams) ||
+                streams.ValueKind != JsonValueKind.Array || streams.GetArrayLength() == 0)
+                return 0;
+
+            var stream = streams[0];
+            if (stream.TryGetProperty("nb_frames", out var frames) &&
+                TryReadPositiveDouble(frames, out var frameCount) && frameCount <= int.MaxValue)
+                return (int)Math.Round(frameCount);
+
+            if (!stream.TryGetProperty("avg_frame_rate", out var frameRateElement)) return 0;
+            var frameRateText = frameRateElement.ValueKind == JsonValueKind.String
+                ? frameRateElement.GetString()
+                : frameRateElement.GetRawText();
+            if (!TryParseRational(frameRateText, out var frameRate)) return 0;
+
+            double duration = 0;
+            if (stream.TryGetProperty("duration", out var streamDuration))
+                TryReadPositiveDouble(streamDuration, out duration);
+            if (duration <= 0 && document.RootElement.TryGetProperty("format", out var format) &&
+                format.TryGetProperty("duration", out var formatDuration))
+                TryReadPositiveDouble(formatDuration, out duration);
+            if (duration <= 0) return 0;
+
+            var estimated = duration * frameRate;
+            return estimated is > 0 and <= int.MaxValue ? (int)Math.Round(estimated) : 0;
+        }
+        catch
+        {
+            return 0;
+        }
+    }
+
+    private static bool TryReadPositiveDouble(JsonElement element, out double value)
+    {
+        value = 0;
+        var text = element.ValueKind == JsonValueKind.String ? element.GetString() : element.GetRawText();
+        return double.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out value) && value > 0;
+    }
+
+    private static bool TryParseRational(string? value, out double result)
+    {
+        result = 0;
+        if (string.IsNullOrWhiteSpace(value)) return false;
+        var parts = value.Split('/');
+        if (parts.Length == 1)
+            return double.TryParse(parts[0], NumberStyles.Float, CultureInfo.InvariantCulture, out result) && result > 0;
+        if (parts.Length != 2 ||
+            !double.TryParse(parts[0], NumberStyles.Float, CultureInfo.InvariantCulture, out var numerator) ||
+            !double.TryParse(parts[1], NumberStyles.Float, CultureInfo.InvariantCulture, out var denominator) ||
+            numerator <= 0 || denominator <= 0)
+            return false;
+        result = numerator / denominator;
+        return double.IsFinite(result) && result > 0;
     }
 
     /// <summary>两路进度(stderr stats / -progress 机读)持续毫无动静时的两级 watchdog：
@@ -1026,7 +1170,17 @@ public sealed partial class Suppressor : IDisposable
     }
 
     private bool HasProgressOutput()
-        => _sawStderrProgress || Volatile.Read(ref _pgLineCount) > 0;
+        => Volatile.Read(ref _progressEvidence) != 0;
+
+    internal static bool ProgressValueShowsAdvancement(string key, string value)
+    {
+        if (key == "frame")
+            return int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var frame)
+                   && frame > 0;
+        if (key == "out_time")
+            return TryParseFfmpegTime(value, out var seconds) && seconds > 0;
+        return false;
+    }
 
     /// <summary>解析 ffmpeg 的 HH:MM:SS(.ms) 时间为秒。失败返回 false（调用方自行走兜底）。</summary>
     private static bool TryParseFfmpegTime(string value, out double seconds)
@@ -1480,12 +1634,68 @@ public sealed partial class Suppressor : IDisposable
         }
     }
 
-    private void TryDeleteProgressFile()
+    private void AbortFailedStart()
     {
-        if (string.IsNullOrEmpty(_progressFilePath)) return;
+        CleanupTerminalState(terminateProcesses: true);
+    }
+
+    private void CleanupTerminalState(bool terminateProcesses)
+    {
+        var cancellation = Interlocked.Exchange(ref _cts, null);
+        try { cancellation?.Cancel(); } catch { /* ignored */ }
+
+        var vapour = Interlocked.Exchange(ref _vProcess, null);
+        var ffmpeg = Interlocked.Exchange(ref _fProcess, null);
+        TerminateWaitAndDispose(vapour, terminateProcesses);
+        TerminateWaitAndDispose(ffmpeg, terminateProcesses);
+
+        var frameProbe = Interlocked.Exchange(ref _frameProbeTask, null);
+        if (frameProbe is not null && !frameProbe.IsCompleted)
+        {
+            try { frameProbe.Wait(TimeSpan.FromSeconds(3)); }
+            catch { /* 探测失败/取消不影响主任务收尾。 */ }
+        }
+
+        try { cancellation?.Dispose(); } catch { /* ignored */ }
+        TryDeleteProgressFile();
+
+        _runtime = null;
+        _pipeTask = null;
+        _logTask = null;
+        _vLogTask = null;
+        _stdoutTask = null;
+        _progressTask = null;
+        _completionTask = null;
+    }
+
+    private static void TerminateWaitAndDispose(Process? process, bool terminate)
+    {
+        if (process is null) return;
         try
         {
-            File.Delete(_progressFilePath);
+            if (terminate || !process.HasExited)
+                TryKill(process);
+            if (!process.HasExited)
+                process.WaitForExit(5000);
+        }
+        catch
+        {
+            // 未启动、已释放或系统拒绝等待；Dispose 仍会执行。
+        }
+        finally
+        {
+            try { process.Dispose(); } catch { /* ignored */ }
+        }
+    }
+
+    private void TryDeleteProgressFile()
+    {
+        var path = _progressFilePath;
+        if (string.IsNullOrEmpty(path)) return;
+        try
+        {
+            File.Delete(path);
+            _progressFilePath = null;
         }
         catch
         {
@@ -1508,18 +1718,8 @@ public sealed partial class Suppressor : IDisposable
     public void Dispose()
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
-
-        try { _cts?.Cancel(); } catch { /* ignored */ }
-        TryKill(_vProcess);
-        TryKill(_fProcess);
-
-        try { _vProcess?.Dispose(); } catch { /* ignored */ }
-        try { _fProcess?.Dispose(); } catch { /* ignored */ }
-        try { _cts?.Dispose(); } catch { /* ignored */ }
-        TryDeleteProgressFile();
-
-        _vProcess = null;
-        _fProcess = null;
+        Volatile.Write(ref _suppressCompletionCallback, 1);
+        CleanupTerminalState(terminateProcesses: true);
     }
 
     [GeneratedRegex(@"^frame=\s{0,}(?<FrameNumber>\d*)\s+fps=\s{0,}(?<FramesPerSecond>[\d\.]+)")]
