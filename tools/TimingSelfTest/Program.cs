@@ -16,22 +16,25 @@ namespace TimingSelfTest;
 // Synthesizes a 30fps 1280x720 video whose dialog boxes are rendered with the SAME
 // SekaiToolsCore TemplateManager glyph pipeline the matcher uses, drives the real
 // VideoProcessor A/B (old behavior via env flags vs new), and compares recorded
-// StartIndex/EndIndex/SeparateFrame against synthesis ground-truth.
+// StartIndex/EndIndex and exported separator boundaries against synthesis ground-truth.
 internal static class Program
 {
     // ---- geometry / synthesis constants ----
     const int W = 1280, H = 720, FPS = 30, N = 780;
     const int Stride = 3;       // frames per typed character
     const int NlPause = 9;      // frames of pause per newline (0.3s @30fps == game)
+    const int SeparatorToleranceFrames = 1; // continuous estimate vs discrete typed-character boundary
     static readonly MCvScalar Bg = new(38, 30, 32); // dark BGR dialog-box-ish background
 
-    static readonly string ScratchDir =
-        "/private/tmp/claude-501/-Users-amia/5a7f190c-1dde-407f-ae83-779148ec5142/scratchpad/selftest";
+    static readonly string ScratchDir = Path.GetFullPath(
+        Environment.GetEnvironmentVariable("SEKAITOOLS_TIMING_SELFTEST_DIR")
+        ?? Path.Combine(Path.GetTempPath(), "sekaitools-timing-selftest"));
     static string FramesDir => Path.Combine(ScratchDir, "frames");
     static string VideoPath => Path.Combine(ScratchDir, "selftest.mp4");
     static string ScriptPath => Path.Combine(ScratchDir, "script.json");
     static string TransPath => Path.Combine(ScratchDir, "translate.txt");
-    const string Ffmpeg = "/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg";
+    static readonly string Ffmpeg =
+        Environment.GetEnvironmentVariable("SEKAITOOLS_FFMPEG") ?? "ffmpeg";
 
     static readonly Size Res = new(W, H);
     static readonly double FrameRatio = W / (double)H;
@@ -148,6 +151,7 @@ internal static class Program
         TemplateMatchCachePool.ResetAll();
         var config = new Config(video, script, trans);
         var collected = new List<DialogBaseFrameSet>();
+        var processingErrors = new List<Exception>();
         var done = new ManualResetEventSlim(false);
         var callbacks = new VideoProcessCallbacks
         {
@@ -160,6 +164,7 @@ internal static class Program
                 Console.WriteLine(
                     $"[dlg {idx,3}] {d.Data.CharacterOriginal,-8} {Sec(d.StartIndex())}->{Sec(d.EndIndex())} ({dur,6:F2}s) {body}");
             },
+            OnException = e => { lock (processingErrors) processingErrors.Add(e); },
             OnTaskFinished = () => done.Set(),
         };
 
@@ -167,9 +172,24 @@ internal static class Program
         var sw = System.Diagnostics.Stopwatch.StartNew();
         proc.StartProcess();
         if (!done.Wait(TimeSpan.FromSeconds(2400)))
-            Console.WriteLine("[real] TIMEOUT waiting for OnTaskFinished");
+        {
+            proc.StopProcess();
+            Console.Error.WriteLine("[FAIL] real: TIMEOUT waiting for OnTaskFinished");
+            return 3;
+        }
         sw.Stop();
         Console.WriteLine($"[real] collected={collected.Count} elapsed={sw.Elapsed} stopReason={proc.StopReason} fps={fps}");
+        if (processingErrors.Count != 0)
+        {
+            foreach (var error in processingErrors)
+                Console.Error.WriteLine($"[FAIL] real processing error: {error}");
+            return 1;
+        }
+        if (proc.StopReason != ProcessStopReason.Completed)
+        {
+            Console.Error.WriteLine($"[FAIL] real stopReason={proc.StopReason}; expected Completed");
+            return 1;
+        }
 
         var subtitle = proc.GenerateSubtitle(
             new List<BannerBaseFrameSet>(), collected, new List<MarkerBaseFrameSet>());
@@ -359,16 +379,22 @@ internal static class Program
                      "-c:v","libx264","-crf","0","-pix_fmt","yuv444p","-r","30",VideoPath})
             psi.ArgumentList.Add(a);
         var p = System.Diagnostics.Process.Start(psi)!;
-        p.StandardError.ReadToEnd();
+        var ffmpegError = p.StandardError.ReadToEnd();
         p.WaitForExit();
         Console.WriteLine($"[gen] ffmpeg exit={p.ExitCode}");
+        if (p.ExitCode != 0)
+            throw new InvalidOperationException($"ffmpeg failed with exit {p.ExitCode}: {ffmpegError}");
         // verify frame count read-back
         using var cap = new VideoCapture(VideoPath);
         int read = 0, first = -1, last = -1;
         var fr = new Mat();
         while (cap.Read(fr)) { var pf = (int)cap.Get(CapProp.PosFrames); if (read == 0) first = pf; last = pf; read++; }
         fr.Dispose();
-        Console.WriteLine($"[gen] readback frames={read} first={first} last={last} fps={cap.Get(CapProp.Fps)}");
+        var readbackFps = cap.Get(CapProp.Fps);
+        Console.WriteLine($"[gen] readback frames={read} first={first} last={last} fps={readbackFps}");
+        if (read != N || first != 1 || last != N || Math.Abs(readbackFps - FPS) > 0.001)
+            throw new InvalidDataException(
+                $"generated video readback mismatch: frames={read}, first={first}, last={last}, fps={readbackFps}");
     }
 
     static void WriteScriptAndTrans()
@@ -447,7 +473,33 @@ internal static class Program
     sealed class DlgResult
     {
         public string Scenario = "";
-        public int Start, End, Sep;
+        public int Start, End;
+        public int ExportSepBeforeLines = -1;
+        public int SourceSepAfterExport = -1;
+        public int LineSep = -1;
+        public int ExportSepAfterLines = -1;
+    }
+
+    static int ExportedSeparatorFrame(string ass, int dialogOrdinal, DialogBaseFrameSet set)
+    {
+        var marker = $"-----  {dialogOrdinal:000}  -----  Line 2 ↓";
+        var lines = ass.Split('\n');
+        var markerIndex = Array.FindIndex(lines, line => line.Contains(marker, StringComparison.Ordinal));
+        if (markerIndex < 0)
+            throw new InvalidDataException($"missing export marker: {marker}");
+        var dialogueLine = lines.Skip(markerIndex + 1)
+            .FirstOrDefault(line => line.StartsWith("Dialogue:", StringComparison.Ordinal));
+        if (dialogueLine == null)
+            throw new InvalidDataException($"missing second-segment dialogue after: {marker}");
+
+        var boundaryTime = SekaiToolsBase.SubStationAlpha.Event.FromString(dialogueLine).Start;
+        var matches = Enumerable.Range(set.StartIndex() + 1, set.EndIndex() - set.StartIndex() - 1)
+            .Where(frame => new ProcessFrame(frame, set.Fps).StartTime() == boundaryTime)
+            .ToList();
+        if (matches.Count != 1)
+            throw new InvalidDataException(
+                $"export boundary {boundaryTime} for {marker} maps to {matches.Count} frames: {string.Join(',', matches)}");
+        return matches[0];
     }
 
     static List<DlgResult> RunOnce(bool oldBehavior)
@@ -458,34 +510,62 @@ internal static class Program
 
         var config = new Config(VideoPath, ScriptPath, TransPath);
         var collected = new List<DialogBaseFrameSet>();
+        var processingErrors = new List<Exception>();
         var done = new ManualResetEventSlim(false);
         var callbacks = new VideoProcessCallbacks
         {
             OnNewDialog = d => { lock (collected) collected.Add(d); },
+            OnException = e => { lock (processingErrors) processingErrors.Add(e); },
             OnTaskFinished = () => done.Set(),
         };
         using var proc = new VideoProcessor(config, callbacks);
         proc.StartProcess();
         if (!done.Wait(TimeSpan.FromSeconds(180)))
-            throw new Exception("processing timeout");
+        {
+            proc.StopProcess();
+            throw new TimeoutException("processing timeout");
+        }
+        if (processingErrors.Count != 0)
+            throw new AggregateException("processing errors", processingErrors);
+        if (proc.StopReason != ProcessStopReason.Completed)
+            throw new InvalidDataException($"processing stopReason={proc.StopReason}; expected Completed");
 
-        // export (populates SeparateFrame for separator dialogs)
+        // Export intentionally estimates and normalizes cloned dialogs; source editor objects must stay unchanged.
         var subtitle = proc.GenerateSubtitle(new List<BannerBaseFrameSet>(), collected, new List<MarkerBaseFrameSet>());
         var ass = subtitle.ToString();
         File.WriteAllText(Path.Combine(ScratchDir, oldBehavior ? "old.ass" : "new.ass"), ass);
 
         var results = new List<DlgResult>();
-        foreach (var set in collected)
+        for (var i = 0; i < collected.Count; i++)
         {
+            var set = collected[i];
             var spec = Specs.FirstOrDefault(s => s.Body == set.Data.BodyOriginal);
-            results.Add(new DlgResult
+            var result = new DlgResult
             {
                 Scenario = spec?.Scenario ?? set.Data.BodyOriginal,
                 Start = set.StartIndex(),
                 End = set.EndIndex(),
-                Sep = set.UseSeparator ? set.Separate.SeparateFrame : -1,
-            });
+            };
+            if (set.UseSeparator)
+            {
+                result.ExportSepBeforeLines = ExportedSeparatorFrame(ass, i + 1, set);
+                result.SourceSepAfterExport = set.Separate.SeparateFrame;
+                // Mirrors SubtitleHandler.LinesAsync: after processing, populate an invalid source value
+                // through the same VideoProcessor.EstimateSeparator wrapper used by engine IPC.
+                proc.EstimateSeparator(set);
+                result.LineSep = set.Separate.SeparateFrame;
+            }
+            results.Add(result);
         }
+
+        // Mirrors export after subtitle.lines has persisted valid separator values on source objects.
+        var afterLinesAss = proc.GenerateSubtitle(
+            new List<BannerBaseFrameSet>(), collected, new List<MarkerBaseFrameSet>()).ToString();
+        File.WriteAllText(Path.Combine(ScratchDir, oldBehavior ? "old-after-lines.ass" : "new-after-lines.ass"), afterLinesAss);
+        for (var i = 0; i < collected.Count; i++)
+            if (collected[i].UseSeparator)
+                results[i].ExportSepAfterLines = ExportedSeparatorFrame(afterLinesAss, i + 1, collected[i]);
+
         Console.WriteLine($"[run] {(oldBehavior ? "OLD" : "NEW")} collected={collected.Count} stopReason={proc.StopReason}");
         return results;
     }
@@ -494,6 +574,21 @@ internal static class Program
     {
         var old = RunOnce(true);
         var neu = RunOnce(false);
+        var failures = 0;
+
+        void Check(string name, int actual, int expected)
+        {
+            if (actual == expected) return;
+            Console.Error.WriteLine($"[FAIL] {name}: expected {expected}, got {actual}");
+            failures++;
+        }
+
+        void CheckTrue(string name, bool condition, string detail)
+        {
+            if (condition) return;
+            Console.Error.WriteLine($"[FAIL] {name}: {detail}");
+            failures++;
+        }
 
         Console.WriteLine();
         Console.WriteLine("=== RESULTS (0-based frame indices; lag = start - groundTruth) ===");
@@ -506,32 +601,72 @@ internal static class Program
             var nn = neu.FirstOrDefault(r => r.Scenario == s.Scenario);
             if (o == null || nn == null)
             {
-                Console.WriteLine($"{s.Scenario,-18} MISSING old={(o != null)} new={(nn != null)}");
+                Console.Error.WriteLine($"[FAIL] {s.Scenario}: MISSING old={(o != null)} new={(nn != null)}");
+                failures++;
                 jsonRows.Add($"{{\"name\":\"{s.Scenario}\",\"missing\":true}}");
                 continue;
             }
+
             int oldLag = o.Start - gt, newLag = nn.Start - gt;
-            Console.WriteLine($"{s.Scenario,-18} gt={gt,3} oldStart={o.Start,3}(lag {oldLag,2}) newStart={nn.Start,3}(lag {newLag,2}) endOld={o.End,3} endNew={nn.End,3} sepOld={o.Sep} sepNew={nn.Sep}");
-            jsonRows.Add($"{{\"name\":\"{s.Scenario}\",\"groundTruthStartFrame\":{gt},\"oldStartFrame\":{o.Start},\"newStartFrame\":{nn.Start},\"oldLagFrames\":{oldLag},\"newLagFrames\":{newLag},\"endOldFrame\":{o.End},\"endNewFrame\":{nn.End},\"sepOld\":{o.Sep},\"sepNew\":{nn.Sep}}}");
+            Console.WriteLine($"{s.Scenario,-18} gt={gt,3} oldStart={o.Start,3}(lag {oldLag,2}) newStart={nn.Start,3}(lag {newLag,2}) endOld={o.End,3} endNew={nn.End,3} sepOld={o.ExportSepBeforeLines} sepNew={nn.ExportSepBeforeLines}");
+            var expectedOldLag = s.Scenario is "B2_rapid_second" or "C2_prefix_second" or "F_sep_rapid3line" ? 6 : 0;
+            Check($"{s.Scenario} old start", o.Start, gt + expectedOldLag);
+            Check($"{s.Scenario} new start", nn.Start, gt);
+            Check($"{s.Scenario} old end", o.End, s.HoldEnd - 1);
+            Check($"{s.Scenario} new end", nn.End, s.HoldEnd - 1);
+            jsonRows.Add($"{{\"name\":\"{s.Scenario}\",\"groundTruthStartFrame\":{gt},\"oldStartFrame\":{o.Start},\"newStartFrame\":{nn.Start},\"oldLagFrames\":{oldLag},\"newLagFrames\":{newLag},\"endOldFrame\":{o.End},\"endNewFrame\":{nn.End},\"sepOld\":{o.ExportSepBeforeLines},\"sepNew\":{nn.ExportSepBeforeLines}}}");
         }
-        // separator report for every UseSeparator spec (3-line original + >37 translation): D and F
+
+        Check("old result count", old.Count, Specs.Count);
+        Check("new result count", neu.Count, Specs.Count);
+
+        // Separator report for every UseSeparator spec (3-line original + >37 translation): D and F.
         Console.WriteLine();
         var sepJson = new List<string>();
         foreach (var s in Specs.Where(s => s.Body.Split('\n').Length == 3 && s.Trans.Length > 37))
         {
             int sepExpected = ExpectedSeparator0Based(s);
-            var os = old.First(r => r.Scenario == s.Scenario);
-            var ns = neu.First(r => r.Scenario == s.Scenario);
+            var os = old.FirstOrDefault(r => r.Scenario == s.Scenario);
+            var ns = neu.FirstOrDefault(r => r.Scenario == s.Scenario);
+            if (os == null || ns == null)
+            {
+                Console.Error.WriteLine($"[FAIL] separator {s.Scenario}: missing result");
+                failures++;
+                continue;
+            }
+
+            var oldError = Math.Abs(os.ExportSepBeforeLines - sepExpected);
+            var newError = Math.Abs(ns.ExportSepBeforeLines - sepExpected);
             Console.WriteLine(
-                $"SEPARATOR {s.Scenario}: expected={sepExpected} old={os.Sep} new={ns.Sep}  |old-exp|={Math.Abs(os.Sep - sepExpected)} |new-exp|={Math.Abs(ns.Sep - sepExpected)}");
+                $"SEPARATOR {s.Scenario}: expected={sepExpected} old={os.ExportSepBeforeLines} new={ns.ExportSepBeforeLines}  |old-exp|={oldError} |new-exp|={newError} tolerance={SeparatorToleranceFrames}");
+
+            Check($"{s.Scenario} old source unchanged by export", os.SourceSepAfterExport, 0);
+            Check($"{s.Scenario} new source unchanged by export", ns.SourceSepAfterExport, 0);
+            Check($"{s.Scenario} old export/lines agreement", os.ExportSepBeforeLines, os.LineSep);
+            Check($"{s.Scenario} new export/lines agreement", ns.ExportSepBeforeLines, ns.LineSep);
+            Check($"{s.Scenario} old export stable after lines", os.ExportSepAfterLines, os.LineSep);
+            Check($"{s.Scenario} new export stable after lines", ns.ExportSepAfterLines, ns.LineSep);
+            CheckTrue($"{s.Scenario} new separator tolerance",
+                newError <= SeparatorToleranceFrames,
+                $"expected within ±{SeparatorToleranceFrames} frame, got error {newError}");
+            CheckTrue($"{s.Scenario} separator improvement",
+                newError < oldError,
+                $"new error {newError} must be smaller than old error {oldError}");
+
             sepJson.Add(
-                $"{{\"name\":\"{s.Scenario}\",\"expectedFrame\":{sepExpected},\"oldFrame\":{os.Sep},\"newFrame\":{ns.Sep}}}");
+                $"{{\"name\":\"{s.Scenario}\",\"expectedFrame\":{sepExpected},\"toleranceFrames\":{SeparatorToleranceFrames},\"oldFrame\":{os.ExportSepBeforeLines},\"newFrame\":{ns.ExportSepBeforeLines},\"sourceAfterExport\":{ns.SourceSepAfterExport},\"lineFrame\":{ns.LineSep},\"exportAfterLinesFrame\":{ns.ExportSepAfterLines}}}");
         }
 
         Console.WriteLine();
         Console.WriteLine("JSON_BEGIN");
         Console.WriteLine("{\"separators\":[" + string.Join(",", sepJson) + "],\"results\":[" + string.Join(",", jsonRows) + "]}");
         Console.WriteLine("JSON_END");
+        if (failures != 0)
+        {
+            Console.Error.WriteLine($"[FAIL] timing self-test failures={failures}");
+            return 1;
+        }
+        Console.WriteLine("[PASS] timing self-test");
         return 0;
     }
 

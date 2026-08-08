@@ -317,7 +317,11 @@ public class VideoProcessor : IDisposable
 
                 if (!capture.Read(frame))
                 {
-                    StopReason = ProcessStopReason.ReadFailed;
+                    // OpenCV reports false both for a decoder failure and for normal EOF. Preserve
+                    // ReadFailed only for an early stop; consuming the advertised frame count is completion.
+                    StopReason = frameCount > 0 && frameIndex >= frameCount
+                        ? ProcessStopReason.Completed
+                        : ProcessStopReason.ReadFailed;
                     break;
                 }
 
