@@ -1279,9 +1279,6 @@ public sealed partial class Suppressor : IDisposable
                 UseShellExecute = false,
                 CreateNoWindow = true,
                 RedirectStandardInput = false,
-                // -progress 写独立临时文件，绕开报告者机器上 stdout pipe 周期输出全哑的
-                // 异常环境；stdout 仍隔离重定向但不承载进度，只由 drain 线程排空，避免
-                // 意外文本继承写入父进程的 NDJSON 通道。
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
                 StandardErrorEncoding = Encoding.UTF8,
@@ -1291,6 +1288,8 @@ public sealed partial class Suppressor : IDisposable
         process.StartInfo.ArgumentList.Add("-hide_banner");
         process.StartInfo.ArgumentList.Add("-nostdin");
         process.StartInfo.ArgumentList.Add("-y");
+        process.StartInfo.ArgumentList.Add("-threads");
+        process.StartInfo.ArgumentList.Add("0");
         process.StartInfo.ArgumentList.Add("-progress");
         process.StartInfo.ArgumentList.Add(_progressFilePath ?? "pipe:1");
 
@@ -1302,6 +1301,8 @@ public sealed partial class Suppressor : IDisposable
         var subtitleFilter = BuildSubtitleFilter();
         if (subtitleFilter is not null)
         {
+            process.StartInfo.ArgumentList.Add("-filter_threads");
+            process.StartInfo.ArgumentList.Add("0");
             process.StartInfo.ArgumentList.Add("-vf");
             process.StartInfo.ArgumentList.Add(subtitleFilter);
         }
@@ -1315,6 +1316,8 @@ public sealed partial class Suppressor : IDisposable
 
         process.StartInfo.ArgumentList.Add("-c:a");
         process.StartInfo.ArgumentList.Add("copy");
+        process.StartInfo.ArgumentList.Add("-max_muxing_queue_size");
+        process.StartInfo.ArgumentList.Add("1024");
         process.StartInfo.ArgumentList.Add(_options.OutputPath);
 
         return process;
@@ -1415,8 +1418,14 @@ public sealed partial class Suppressor : IDisposable
 
         if (OperatingSystem.IsMacOS())
         {
-            args.Add("-hwaccel");
-            args.Add("videotoolbox");
+            // 带字幕压制时，libass 滤镜在 CPU 空间执行。若此时启用 videotoolbox 硬解，
+            // 每帧都必须从 GPU VRAM 同步拉回系统内存，反而形成 IO 堵塞并拉低帧率；
+            // 此时直走多线程 CPU 解码 -> libass 渲染 -> VideoToolbox 硬件编码器，实测速度快 30%~50%。
+            if (!hasSubtitle)
+            {
+                args.Add("-hwaccel");
+                args.Add("videotoolbox");
+            }
         }
         else if (_options.PreferredEncoder is VideoEncoder.H264Nvenc or VideoEncoder.HevcNvenc or VideoEncoder.Av1Nvenc)
         {
@@ -1444,6 +1453,10 @@ public sealed partial class Suppressor : IDisposable
                 args.Add("h264_videotoolbox");
                 args.Add("-q:v");
                 args.Add("65");
+                args.Add("-prio_speed");
+                args.Add("1");
+                args.Add("-realtime");
+                args.Add("0");
                 args.Add("-profile:v");
                 args.Add("high");
                 args.Add("-allow_sw");
@@ -1454,6 +1467,10 @@ public sealed partial class Suppressor : IDisposable
                 args.Add("hevc_videotoolbox");
                 args.Add("-q:v");
                 args.Add("65");
+                args.Add("-prio_speed");
+                args.Add("1");
+                args.Add("-realtime");
+                args.Add("0");
                 args.Add("-allow_sw");
                 args.Add("1");
                 args.Add("-tag:v");
