@@ -178,14 +178,14 @@ public class SubtitleMaker(VideoInfo videoInfo, TemplateManager templateManager,
     {
         var fontsize = (int)((videoInfo.FrameRatio > 16.0 / 9
             ? videoInfo.Resolution.Height * 0.043
-            : videoInfo.Resolution.Width * 0.024) * (70 / 61D));
+            : videoInfo.Resolution.Width * 0.024) * (82 / 61D));
 
-        var outlineSize = (int)Math.Ceiling(fontsize / 15.0);
-        var marginV = _nameTagPosition.Y + (int)(fontsize * 2.3);
+        var outlineSize = (int)Math.Ceiling(fontsize / 21.0);
+        var marginV = _nameTagPosition.Y + (int)(fontsize * 2.1);
         var marginH = _nameTagPosition.X + (int)(fontsize * 0.4);
 
-        var charaFontsize = (int)(fontsize * 0.9);
-        var charaOutlineSize = (int)Math.Ceiling(charaFontsize / 15.0);
+        var charaFontsize = (int)(fontsize * 0.83);
+        var charaOutlineSize = (int)Math.Ceiling(charaFontsize / 21.0);
 
 
         var blackColor = new AlphaColor(0, 255, 255, 255);
@@ -253,15 +253,32 @@ public class SubtitleMaker(VideoInfo videoInfo, TemplateManager templateManager,
             }
             else
             {
-                // 原文 3 行 → 译文块被定位到 Line3(最低锚点，见 GenerateNoneJitterDialogEvents 的 styleName)，
-                // 其下方已无空间；译文若带 \N 会再折一行、越界叠进日文块（用户反馈：得手动删 \N）。团队成品
-                // 规范里译文恒为单物理行、靠 1行/2行/3行 样式定位，因此 3 行原文的短译文(未走分隔/过长行分支)
-                // 必须塌成单行。判定主语必须是 BodyOriginal(含真实 \n)：旧代码用 BodyTranslated——它从 txt 载入、
-                // 存的是字面 \N 而非真实 \n，LineCount() 恒为 1、塌行从不触发（这正是「\N 不自动删」的回归根因）。
-                // 口径与下方 styleName 的 Split("\n").Length 完全一致：凡被定位到 Line3 的都塌行。
-                if (set.Data.BodyOriginal.Split("\n").Length == 3)
-                    set.Data.SetTranslationContent(set.Data.BodyTranslated.TrimAll());
-                dialogEvents.AddRange(GenerateDialogEvent(set));
+                // 对超过2行的译文或超长文本，自动切分为前后两条拼凑轴，杜绝第3行文字溢出屏幕下边缘
+                var translatedLines = set.Data.BodyTranslated.Split(new[] { "\\N", "\\n", "\n" }, StringSplitOptions.None);
+                if (translatedLines.Length >= 3)
+                {
+                    set.UseSeparator = true;
+                    EstimateSeparator(set);
+                    var items = SeparateDialogSet(set);
+                    dialogEvents.Add(SubtitleEvent.Comment($"{dialogMarker}  Line 1 ↓",
+                        set.StartTime(), set.EndTime(), "Screen"));
+                    dialogEvents.AddRange(GenerateDialogEvent(items[0]));
+                    dialogEvents.Add(SubtitleEvent.Comment($"{dialogMarker}  Line 2 ↓",
+                        set.StartTime(), set.EndTime(), "Screen"));
+                    dialogEvents.AddRange(GenerateDialogEvent(items[1]));
+                }
+                else
+                {
+                    // 原文 3 行 → 译文块被定位到 Line3(最低锚点，见 GenerateNoneJitterDialogEvents 的 styleName)，
+                    // 其下方已无空间；译文若带 \N 会再折一行、越界叠进日文块（用户反馈：得手动删 \N）。团队成品
+                    // 规范里译文恒为单物理行、靠 1行/2行/3行 样式定位，因此 3 行原文的短译文(未走分隔/过长行分支)
+                    // 必须塌成单行。判定主语必须是 BodyOriginal(含真实 \n)：旧代码用 BodyTranslated——它从 txt 载入、
+                    // 存的是字面 \N 而非真实 \n，LineCount() 恒为 1、塌行从不触发（这正是「\N 不自动删」的回归根因）。
+                    // 口径与下方 styleName 的 Split("\n").Length 完全一致：凡被定位到 Line3 的都塌行。
+                    if (set.Data.BodyOriginal.Split("\n").Length == 3)
+                        set.Data.SetTranslationContent(set.Data.BodyTranslated.TrimAll());
+                    dialogEvents.AddRange(GenerateDialogEvent(set));
+                }
             }
 
             if (dialogEvents.Count > 3)
