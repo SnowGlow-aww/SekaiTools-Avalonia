@@ -1285,11 +1285,16 @@ public sealed partial class Suppressor : IDisposable
             },
         };
 
+        var coreCount = Environment.ProcessorCount;
+        var isHw = IsHardwareEncoder(_options.PreferredEncoder);
+        var decodeThreads = isHw ? Math.Clamp(coreCount / 2, 2, 4) : Math.Clamp(coreCount, 2, 8);
+        var filterThreads = Math.Clamp(coreCount / 2, 2, 4);
+
         process.StartInfo.ArgumentList.Add("-hide_banner");
         process.StartInfo.ArgumentList.Add("-nostdin");
         process.StartInfo.ArgumentList.Add("-y");
         process.StartInfo.ArgumentList.Add("-threads");
-        process.StartInfo.ArgumentList.Add("0");
+        process.StartInfo.ArgumentList.Add(decodeThreads.ToString());
         process.StartInfo.ArgumentList.Add("-progress");
         process.StartInfo.ArgumentList.Add(_progressFilePath ?? "pipe:1");
 
@@ -1302,7 +1307,7 @@ public sealed partial class Suppressor : IDisposable
         if (subtitleFilter is not null)
         {
             process.StartInfo.ArgumentList.Add("-filter_threads");
-            process.StartInfo.ArgumentList.Add("0");
+            process.StartInfo.ArgumentList.Add(filterThreads.ToString());
             process.StartInfo.ArgumentList.Add("-vf");
             process.StartInfo.ArgumentList.Add(subtitleFilter);
         }
@@ -1535,7 +1540,9 @@ public sealed partial class Suppressor : IDisposable
                 args.Add("-crf");
                 args.Add(_options.Crf.ToString());
                 args.Add("-preset");
-                args.Add("medium");
+                args.Add("fast");
+                args.Add("-x265-params");
+                args.Add("no-sao=1");
                 args.Add("-tag:v");
                 args.Add("hvc1");
                 break;
@@ -1626,6 +1633,14 @@ public sealed partial class Suppressor : IDisposable
                 args.Add(x264);
                 break;
         }
+    }
+
+    private static bool IsHardwareEncoder(VideoEncoder encoder)
+    {
+        return encoder is VideoEncoder.H264Nvenc or VideoEncoder.HevcNvenc or VideoEncoder.Av1Nvenc
+            or VideoEncoder.H264Qsv or VideoEncoder.HevcQsv or VideoEncoder.Av1Qsv
+            or VideoEncoder.H264Amf or VideoEncoder.HevcAmf or VideoEncoder.Av1Amf
+            or VideoEncoder.H264VideoToolbox or VideoEncoder.HevcVideoToolbox;
     }
 
     private static void BoostProcessPriority(Process? p)

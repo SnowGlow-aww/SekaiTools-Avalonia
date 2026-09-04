@@ -478,16 +478,17 @@ Dialogue: 0,0:00:00.00,0:00:00.20,System,,0,0,0,,Font subsystem check 123
             ?
             [
                 VideoEncoder.HevcVideoToolbox, VideoEncoder.H264VideoToolbox,
+                VideoEncoder.Libx265, VideoEncoder.Libx264,
             ]
             :
             [
                 // Windows/Linux：独显优先——NVENC（N 卡）与 AMF（A 卡）整组排在
                 // QSV（绝大多数机器上是 CPU 核显）前面：双显卡机器上核显吞吐/画质
                 // 都不如独显，不该因为"HEVC"标签就把推荐落到核显上。
-                // 同一块卡内部 HEVC 优先于 H264。
-                VideoEncoder.HevcNvenc, VideoEncoder.HevcAmf,
-                VideoEncoder.H264Nvenc, VideoEncoder.H264Amf,
-                VideoEncoder.HevcQsv, VideoEncoder.H264Qsv,
+                // 同一块卡内部 HEVC 优先于 H264；软编兜底优先 x265（全量 HEVC 生态）。
+                VideoEncoder.HevcNvenc, VideoEncoder.HevcAmf, VideoEncoder.HevcQsv,
+                VideoEncoder.H264Nvenc, VideoEncoder.H264Amf, VideoEncoder.H264Qsv,
+                VideoEncoder.Libx265, VideoEncoder.Libx264,
             ];
 
         foreach (var encoder in preference)
@@ -496,7 +497,7 @@ Dialogue: 0,0:00:00.00,0:00:00.20,System,,0,0,0,,Font subsystem check 123
                 return encoder;
         }
 
-        return VideoEncoder.Libx264;
+        return available.Contains(VideoEncoder.Libx265) ? VideoEncoder.Libx265 : VideoEncoder.Libx264;
     }
 
     private static bool TryResolveVapourSynth(
