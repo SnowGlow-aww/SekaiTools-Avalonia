@@ -15,7 +15,9 @@ public class TemplateMatchCachePool
         DialogContent2 = 4,
         DialogContent3 = 5,
         Marker = 6,
-        Misc = 7
+        Misc = 7,
+        ProbeNameTag = 8,
+        ProbeContent = 9
     }
 
     private static volatile List<TemplateMatchCachePool>? _globalPool;
@@ -58,7 +60,7 @@ public class TemplateMatchCachePool
             lock (_globalGate)
             {
                 if (_globalPool != null) return _globalPool;
-                const int len = (int)MatchUsage.Misc + 1;
+                const int len = (int)MatchUsage.ProbeContent + 1;
                 var built = new List<TemplateMatchCachePool>(len);
                 for (var i = 0; i < len; i++) built.Add(new TemplateMatchCachePool());
                 _globalPool = built;
@@ -99,6 +101,9 @@ public class TemplateMatchCachePool
         GlobalPool[(int)MatchUsage.DialogContent1].Reset();
         GlobalPool[(int)MatchUsage.DialogContent2].Reset();
         GlobalPool[(int)MatchUsage.DialogContent3].Reset();
+        GlobalPool[(int)MatchUsage.ProbeNameTag].Reset();
+        GlobalPool[(int)MatchUsage.ProbeContent].Reset();
+        GlobalPool[(int)MatchUsage.Misc].Reset();
     }
 
     // Takes over caching of this frame's search image, disposing the previous prevImg it

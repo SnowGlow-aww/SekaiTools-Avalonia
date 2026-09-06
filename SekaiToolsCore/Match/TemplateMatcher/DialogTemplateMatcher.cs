@@ -90,65 +90,99 @@ public class DialogTemplateMatcher(
         _onsetDuringHold = duringHold;
     }
 
-    /// <summary>
-    /// 起笔探测：用"名牌(正常阈值,无 fallback) + 内容首字(降阈)"判断某条对话此刻是否已经开始出现在画面里，
-    /// 命中则记录其最早帧供真实命中时回溯起点。与 ProbeDialog(需 6 字指纹)不同——这里只要首字微微出现即算数，
-    /// 目的正是抓到"打字机刚落笔"的那一刻。命中/失配都按连续性维护候选(见下)。
-    /// </summary>
-    private void TryProbeOnset(Mat img, int dialogIdx, int frameIndex, bool duringHold)
+    private struct CandidateProbeResult
     {
+        public bool NameMatched;
+        public Point Point;
+        public bool OnsetHit;
+        public bool FullProbeHit;
+    }
+
+    /// <summary>
+    /// 统一候选台词探测：名牌 -> 内容首字(起笔降阈) -> 内容前缀(全长指纹，正常阈值)。
+    /// 门控短路执行：名牌未命中则不测内容；首字未达起笔降阈则不测全长指纹；
+    /// 统一使用专用的 ProbeNameTag / ProbeContent 缓存槽，消除与 Misc 之间的逐帧对冲失效。
+    /// </summary>
+    private CandidateProbeResult ProbeCandidate(Mat img, int dialogIdx)
+    {
+        if (dialogIdx < 0 || dialogIdx >= Set.Count) return default;
         var dialogBase = Set[dialogIdx];
-        var body = dialogBase.Data.BodyOriginal;
-        if (string.IsNullOrEmpty(body))
-        {
-            // 正文为空 → 无法用内容首字确认，视为未命中；若陈旧候选属于本条则按失配清掉。
-            if (_onsetDialogIndex == dialogIdx) ResetOnset();
-            return;
-        }
 
-        var hit = false;
-        var point = Point.Empty;
-
-        // 1) 名牌(正常阈值, 不用 fallback，同 ProbeDialog 第一步)
+        // 1) 名牌 (正常阈值，不用 fallback)
         var nameTpl = GetNameTag(TrimTemplateContent(dialogBase.Data.CharacterOriginal));
         var nameThr = dialogBase.Data.Shake
             ? config.MatchingThreshold.DialogNametagSpecial
             : config.MatchingThreshold.DialogNametagNormal;
         var nameRoi = NameTagCropArea(nameTpl.Size, dialogBase.Data.Shake);
-        if (!(nameRoi.IsEmpty || nameRoi.Width < nameTpl.Size.Width || nameRoi.Height < nameTpl.Size.Height))
-        {
-            using var nameCrop = new Mat(img, nameRoi);
-            var nameRes = TemplateMatcher.Match(nameCrop, nameTpl, TemplateMatchCachePool.MatchUsage.Misc);
-            if (nameRes.MaxVal > nameThr && nameRes.MaxVal < 1)
-            {
-                point = new Point(nameRes.MaxLoc.X + nameRoi.X, nameRes.MaxLoc.Y + nameRoi.Y);
+        if (nameRoi.IsEmpty || nameRoi.Width < nameTpl.Size.Width || nameRoi.Height < nameTpl.Size.Height)
+            return default;
 
-                // 2) 内容首字(前 1 字)——降阈 max(内容阈值-Δ, 下限)，抓打字机刚落笔的首帧。ROI 同 ProbeDialog 第二步。
-                var contentTpl = templateManager.GetGaTemplate(TemplateUsage.DialogContent, body[..1]);
-                var contentThr = Math.Max(
-                    (dialogBase.Data.Shake
-                        ? config.MatchingThreshold.DialogContentSpecial
-                        : config.MatchingThreshold.DialogContentNormal) - OnsetThresholdDelta,
-                    OnsetMinThreshold);
-                var offset = TemplateManager.GetFontSize(img.Size);
-                var crect = new Rectangle(point.X + (int)(0.1 * offset), point.Y + (int)(1.1 * offset),
-                    (int)(7.5 * offset), (int)(2.0 * offset));
-                if (dialogBase.Data.Shake) crect.Extend(0.6);
-                crect.Limit(new Rectangle(Point.Empty, videoInfo.Resolution));
-                if (!(crect.IsEmpty || crect.Width < contentTpl.Size.Width || crect.Height < contentTpl.Size.Height))
-                {
-                    using var contentCrop = new Mat(img, crect);
-                    var contentRes = TemplateMatcher.Match(contentCrop, contentTpl,
-                        TemplateMatchCachePool.MatchUsage.Misc);
-                    hit = contentRes.MaxVal > contentThr && contentRes.MaxVal < 1;
-                }
+        using var nameCrop = new Mat(img, nameRoi);
+        var nameRes = TemplateMatcher.Match(nameCrop, nameTpl, TemplateMatchCachePool.MatchUsage.ProbeNameTag);
+        if (!(nameRes.MaxVal > nameThr && nameRes.MaxVal < 1))
+            return default;
+
+        var point = new Point(nameRes.MaxLoc.X + nameRoi.X, nameRes.MaxLoc.Y + nameRoi.Y);
+        var body = dialogBase.Data.BodyOriginal;
+        if (string.IsNullOrEmpty(body))
+            return new CandidateProbeResult { NameMatched = true, Point = point, OnsetHit = true, FullProbeHit = true };
+
+        var offset = TemplateManager.GetFontSize(img.Size);
+        var crect = new Rectangle(point.X + (int)(0.1 * offset), point.Y + (int)(1.1 * offset),
+            (int)(7.5 * offset), (int)(2.0 * offset));
+        if (dialogBase.Data.Shake)
+        {
+            var pad = (int)(offset * 0.2);
+            crect.Inflate(pad, pad);
+        }
+        crect.Limit(new Rectangle(Point.Empty, videoInfo.Resolution));
+
+        var contentThr = dialogBase.Data.Shake
+            ? config.MatchingThreshold.DialogContentSpecial
+            : config.MatchingThreshold.DialogContentNormal;
+        var onsetThr = Math.Max(contentThr - OnsetThresholdDelta, OnsetMinThreshold);
+
+        // 2) 内容首字(起笔探测，降阈)
+        var charOneTpl = templateManager.GetGaTemplate(TemplateUsage.DialogContent, body[..1]);
+        if (crect.IsEmpty || crect.Width < charOneTpl.Size.Width || crect.Height < charOneTpl.Size.Height)
+            return new CandidateProbeResult { NameMatched = true, Point = point };
+
+        using var contentCrop = new Mat(img, crect);
+        var charOneRes = TemplateMatcher.Match(contentCrop, charOneTpl, TemplateMatchCachePool.MatchUsage.ProbeContent);
+        var onsetHit = charOneRes.MaxVal > onsetThr && charOneRes.MaxVal < 1;
+        if (!onsetHit)
+            return new CandidateProbeResult { NameMatched = true, Point = point, OnsetHit = false, FullProbeHit = false };
+
+        // 3) 首字已出现，进一步测前 ≤6 字指纹(前瞻与交接判定)
+        var prefix = body[..Math.Min(6, body.Length)];
+        bool fullHit;
+        if (prefix.Length == 1)
+        {
+            fullHit = charOneRes.MaxVal > contentThr && charOneRes.MaxVal < 1;
+        }
+        else
+        {
+            var prefixTpl = templateManager.GetGaTemplate(TemplateUsage.DialogContent, prefix);
+            if (crect.Width < prefixTpl.Size.Width || crect.Height < prefixTpl.Size.Height)
+                fullHit = false;
+            else
+            {
+                var prefixRes = TemplateMatcher.Match(contentCrop, prefixTpl, TemplateMatchCachePool.MatchUsage.ProbeContent);
+                fullHit = prefixRes.MaxVal > contentThr && prefixRes.MaxVal < 1;
             }
         }
 
-        if (hit)
-            RecordOnset(dialogIdx, frameIndex, point, duringHold);
+        return new CandidateProbeResult { NameMatched = true, Point = point, OnsetHit = onsetHit, FullProbeHit = fullHit };
+    }
+
+    private void TryProbeOnset(Mat img, int dialogIdx, int frameIndex, bool duringHold)
+    {
+        if (dialogIdx < 0 || dialogIdx >= Set.Count) return;
+        var probe = ProbeCandidate(img, dialogIdx);
+        if (probe.OnsetHit)
+            RecordOnset(dialogIdx, frameIndex, probe.Point, duringHold);
         else if (_onsetDialogIndex == dialogIdx)
-            ResetOnset(); // 连续性要求：本条一旦失配就清掉陈旧候选，防止用过时的帧回溯
+            ResetOnset();
     }
 
     private GaMat GetNameTag(string name)
@@ -163,7 +197,20 @@ public class DialogTemplateMatcher(
             ? config.MatchingThreshold.DialogNametagSpecial
             : config.MatchingThreshold.DialogNametagNormal;
 
-        var roi = NameTagCropArea(template.Size, dialogBase.Data.Shake);
+        Rectangle roi;
+        if (dialogBase.Data.Shake && !dialogBase.IsEmpty())
+        {
+            // 已在追踪中的抖动行：名牌位置就在上一帧位置的抖动邻域内(±pad)，无需搜索整个对话区域
+            var lastPt = dialogBase.End().Point;
+            var pad = (int)(TemplateManager.GetFontSize(videoInfo.Resolution) * 0.8);
+            roi = new Rectangle(lastPt.X - pad, lastPt.Y - pad, template.Size.Width + pad * 2, template.Size.Height + pad * 2);
+            roi.Limit(new Rectangle(Point.Empty, videoInfo.Resolution));
+        }
+        else
+        {
+            roi = NameTagCropArea(template.Size, dialogBase.Data.Shake);
+        }
+
         if (roi.IsEmpty || roi.Width < template.Size.Width || roi.Height < template.Size.Height) return Point.Empty;
         using var imgCropped = new Mat(img, roi);
         var result = TemplateMatcher.Match(imgCropped, template, TemplateMatchCachePool.MatchUsage.DialogNameTag);
@@ -185,51 +232,15 @@ public class DialogTemplateMatcher(
         return Point.Empty;
     }
 
-    /// <summary>
-    /// look-ahead 探测：用正常阈值、无 fallback、不写任何状态地判断某条对话此刻是否在画面里。
-    /// **名牌 + 内容前缀双重判定**：名牌区分说话人，内容前 3 个字区分"同一说话人的不同台词"
-    /// (如连续多条大神使台词 『…… / 『—— / 『そ……，名牌都一样，必须靠内容前缀才能认准是哪一条)。
-    /// 仅用于"卡住跳过"——当前对话卡死时在窗口里找"真正出现在画面上的那一条"。
-    /// </summary>
+    private bool ProbeDialog(Mat img, int dialogIdx)
+    {
+        return ProbeCandidate(img, dialogIdx).FullProbeHit;
+    }
+
     private bool ProbeDialog(Mat img, DialogBaseFrameSet dialogBase)
     {
-        // 1) 名牌
-        var nameTpl = GetNameTag(TrimTemplateContent(dialogBase.Data.CharacterOriginal));
-        var nameThr = dialogBase.Data.Shake
-            ? config.MatchingThreshold.DialogNametagSpecial
-            : config.MatchingThreshold.DialogNametagNormal;
-        var nameRoi = NameTagCropArea(nameTpl.Size, dialogBase.Data.Shake);
-        if (nameRoi.IsEmpty || nameRoi.Width < nameTpl.Size.Width || nameRoi.Height < nameTpl.Size.Height)
-            return false;
-        using var nameCrop = new Mat(img, nameRoi);
-        var nameRes = TemplateMatcher.Match(nameCrop, nameTpl, TemplateMatchCachePool.MatchUsage.Misc);
-        if (!(nameRes.MaxVal > nameThr && nameRes.MaxVal < 1)) return false;
-        var point = new Point(nameRes.MaxLoc.X + nameRoi.X, nameRes.MaxLoc.Y + nameRoi.Y);
-
-        // 2) 内容前缀(前 ≤6 个字)——区分同名说话人的不同台词。与主匹配一致用 6 字指纹，
-        //    避免 3 字在共享前缀(『……/『私 等)的相邻台词间串扰，导致跳过探测落到错的那条。
-        //    ⚠ 这里**故意不**像 GetDialogInd 那样裁到第一视觉行：ProbeDialog 探测的是「下一条是否已出现」，
-        //    保留完整 6 字(可跨行内 `\n`)才有足够区分度——把它裁短会让「后一条短首行 + 与前一条共享前缀
-        //    (同说话人)」时，后条的短指纹误命中前条画面残留的同前缀内容，从而把还在显示的前条腰斩(正是
-        //    6c3ebf5 要消灭的滞后串扰)。短首行的下一条即便探不到(6 字跨行对不齐其折行画面)，也会由掉帧
-        //    宽限的正常收尾兜住，不会误伤。当前条自身能否到 Matched3 由 GetDialogInd(裁首行)保证，与此无关。
-        var body = dialogBase.Data.BodyOriginal;
-        if (string.IsNullOrEmpty(body)) return true; // 无正文则只认名牌
-        var prefix = body[..Math.Min(6, body.Length)];
-        var contentTpl = templateManager.GetGaTemplate(TemplateUsage.DialogContent, prefix);
-        var contentThr = dialogBase.Data.Shake
-            ? config.MatchingThreshold.DialogContentSpecial
-            : config.MatchingThreshold.DialogContentNormal;
-        var offset = TemplateManager.GetFontSize(img.Size);
-        var crect = new Rectangle(point.X + (int)(0.1 * offset), point.Y + (int)(1.1 * offset),
-            (int)(7.5 * offset), (int)(2.0 * offset));
-        if (dialogBase.Data.Shake) crect.Extend(0.6);
-        crect.Limit(new Rectangle(Point.Empty, videoInfo.Resolution));
-        if (crect.IsEmpty || crect.Width < contentTpl.Size.Width || crect.Height < contentTpl.Size.Height)
-            return false;
-        using var contentCrop = new Mat(img, crect);
-        var contentRes = TemplateMatcher.Match(contentCrop, contentTpl, TemplateMatchCachePool.MatchUsage.Misc);
-        return contentRes.MaxVal > contentThr && contentRes.MaxVal < 1;
+        var idx = Set.IndexOf(dialogBase);
+        return idx >= 0 && ProbeDialog(img, idx);
     }
 
     private Size GetDialogAreaSize()
@@ -267,27 +278,18 @@ public class DialogTemplateMatcher(
             Width = (int)(ntt.Width + ntt.Height * 1.8)
         };
         if (shake)
-            rect.Extend(0.6);
+        {
+            var pad = (int)(TemplateManager.GetFontSize(videoInfo.Resolution) * 0.8);
+            rect.Inflate(pad, pad);
+        }
 
         rect.Limit(new Rectangle(Point.Empty, videoInfo.Resolution));
         return rect;
     }
 
-    private static string TrimTemplateContent(string origin, int maxLen = 3)
+    private static string TrimTemplateContent(string origin)
     {
-        var trimmed = "";
-        var len = 0D;
-        foreach (var c in origin)
-        {
-            trimmed += c;
-            len += char.IsAscii(c) ? 0.5 : 1;
-            if (len >= maxLen) break;
-        }
-
-        if (trimmed.Contains('・'))
-            trimmed = trimmed[..trimmed.IndexOf('・')];
-
-        return trimmed;
+        return origin.Trim();
     }
 
     // 内容指纹只取**第一视觉行**(不跨行内 `\n`)。内容模板由 CreateImageWithText 渲染成**单行水平字条**，
@@ -381,7 +383,10 @@ public class DialogTemplateMatcher(
                 (int)(2.0 * offset)
             );
             if (dialogBase.Data.Shake)
-                dialogStartPosition.Extend(0.6);
+            {
+                var pad = (int)(offset * 0.2);
+                dialogStartPosition.Inflate(pad, pad);
+            }
             dialogStartPosition.Limit(new Rectangle(Point.Empty, videoInfo.Resolution));
             if (dialogStartPosition.IsEmpty ||
                 dialogStartPosition.Width < tmp.Size.Width ||
@@ -516,20 +521,24 @@ public class DialogTemplateMatcher(
                         // 一旦下一条出现，立刻结束宽限、定版当前条并在本帧前进去匹配下一条。
                         var probeIdx = dIndex + 1;
                         while (probeIdx < Set.Count && Set[probeIdx].Finished) probeIdx++;
-                        var nextAppeared = probeIdx < Set.Count && ProbeDialog(frame, Set[probeIdx]);
-                        if (!nextAppeared)
+                        if (probeIdx < Set.Count)
                         {
-                            // 下一条 6 字指纹还没打全(所以 nextAppeared 假)，但它的首字可能已经落笔——
-                            // 每帧探一下起笔，记下最早出现帧，稍后下一条真正命中时把起点回溯到这里(消滞后)。
-                            if (probeIdx < Set.Count) TryProbeOnset(frame, probeIdx, frameIndex, false);
-                            _droppedGrace++;
-                            _pendingFrames.Add((frameIndex, Set[dIndex].End().Point));
-                            _useFallbackThreshold = true;
-                            _status = _lastMatchedStatus;
-                            return IsStatusMatched(_lastMatchedStatus);
+                            var probe = ProbeCandidate(frame, probeIdx);
+                            if (!probe.FullProbeHit)
+                            {
+                                if (probe.OnsetHit)
+                                    RecordOnset(probeIdx, frameIndex, probe.Point, false);
+                                else if (_onsetDialogIndex == probeIdx)
+                                    ResetOnset();
+
+                                _droppedGrace++;
+                                _pendingFrames.Add((frameIndex, Set[dIndex].End().Point));
+                                _useFallbackThreshold = true;
+                                _status = _lastMatchedStatus;
+                                return IsStatusMatched(_lastMatchedStatus);
+                            }
+                            _pendingFrames.Clear();
                         }
-                        // 下一条已出现：丢弃宽限缓冲，立即定版当前条并前进。
-                        _pendingFrames.Clear();
                     }
 
                     Set[dIndex].Finished = true;
@@ -569,15 +578,26 @@ public class DialogTemplateMatcher(
                         _emptyStuckFrames >= SkipProbeFrames)
                     {
                         // 在 [dIndex+1, dIndex+LookaheadWindow] 窗口里找"第一条此刻出现在画面里"的后续对话。
+                        // 节流与同说话人合并：每 2 帧探测一次；同说话人名牌失配时跳过该说话人的后续候选，防止 CPU 耗尽。
                         var found = -1;
-                        var windowEnd = Math.Min(dIndex + LookaheadWindow, Set.Count - 1);
-                        for (var k = dIndex + 1; k <= windowEnd; k++)
+                        if (_emptyStuckFrames % 2 == 0)
                         {
-                            if (Set[k].Finished) continue;
-                            if (ProbeDialog(frame, Set[k]))
+                            var windowEnd = Math.Min(dIndex + LookaheadWindow, Set.Count - 1);
+                            string? failedSpeaker = null;
+                            for (var k = dIndex + 1; k <= windowEnd; k++)
                             {
-                                found = k;
-                                break;
+                                if (Set[k].Finished) continue;
+                                var speaker = TrimTemplateContent(Set[k].Data.CharacterOriginal);
+                                if (failedSpeaker != null && speaker == failedSpeaker) continue;
+
+                                var probe = ProbeCandidate(frame, k);
+                                if (probe.FullProbeHit)
+                                {
+                                    found = k;
+                                    break;
+                                }
+                                if (!probe.NameMatched)
+                                    failedSpeaker = speaker;
                             }
                         }
 
@@ -620,38 +640,37 @@ public class DialogTemplateMatcher(
                     _useFallbackThreshold = false;
                     return IsStatusMatched(firstStatus.Value);
                 default:
-                    // 防滞后(关键)：当前行只到 Matched1/Matched2 时，它是在用**短前缀**(content[..1]=『 或
-                    // content[..3]=『……)硬撑——这类前缀在共享开头的相邻台词间不具区分度，会把"已经结束的
-                    // 当前行"粘在**下一条**的台框上，使匹配整段滞后(实测 36/37 行滞后 7~14 秒，导致 38-40 被跳)。
-                    // 某些行因首 6 字含特殊排版(！/空格/——)始终到不了 Matched3(6字指纹)，更会长期卡在 Matched2。
-                    // 因此：只要当前行还没到 Matched3，且**下一条**已带名牌+6字内容指纹清晰出现在画面里，
-                    // 就立刻定版当前行并前进，不被短前缀的"假命中"拖住。到了 Matched3 的行本身有区分度，
-                    // 其结束由掉帧宽限的前进探测处理，不在此列。
+                    // 防滞后(关键)：当前行只到 Matched1/Matched2 时，它是在用短前缀硬撑——
+                    // 这类短前缀在共享开头的相邻台词间不具区分度。若下一条已带名牌+6字内容指纹清晰出现在画面里，
+                    // 就立刻定版当前行并前进，不被短前缀的假命中拖住。到了 Matched3 的行本身有区分度，
+                    // 其结束由掉帧宽限的前进探测处理。
                     if (_status is MatchStatus.DialogMatched1 or MatchStatus.DialogMatched2 &&
                         !Set[dIndex].IsEmpty())
                     {
                         var nextI = dIndex + 1;
                         while (nextI < Set.Count && Set[nextI].Finished) nextI++;
-                        // 当前行卡在短前缀 hold 期间(其命中本身可疑)，每帧探下一条起笔并标记 duringHold——
-                        // 这类候选不因"当前行继续命中"作废，由 0.35s 上限兜底，专治此路径下下一条起点晚约 6 字打字时长。
-                        if (nextI < Set.Count) TryProbeOnset(frame, nextI, frameIndex, true);
-                        if (nextI < Set.Count && ProbeDialog(frame, Set[nextI]))
+                        if (nextI < Set.Count)
                         {
-                            if (_pendingFrames.Count > 0)
+                            var probe = ProbeCandidate(frame, nextI);
+                            if (probe.OnsetHit) RecordOnset(nextI, frameIndex, probe.Point, true);
+                            if (probe.FullProbeHit)
                             {
-                                foreach (var (idx, pt) in _pendingFrames) Set[dIndex].Add(idx, pt);
-                                _pendingFrames.Clear();
-                            }
+                                if (_pendingFrames.Count > 0)
+                                {
+                                    foreach (var (idx, pt) in _pendingFrames) Set[dIndex].Add(idx, pt);
+                                    _pendingFrames.Clear();
+                                }
 
-                            Set[dIndex].Finished = true;
-                            _droppedGrace = 0;
-                            _consecutiveFailures = 0;
-                            _useFallbackThreshold = false;
-                            _emptyStuckFrames = 0;
-                            _lookaheadHits = 0;
-                            _lookaheadTarget = -1;
-                            TemplateMatchCachePool.NextDialog();
-                            continue;
+                                Set[dIndex].Finished = true;
+                                _droppedGrace = 0;
+                                _consecutiveFailures = 0;
+                                _useFallbackThreshold = false;
+                                _emptyStuckFrames = 0;
+                                _lookaheadHits = 0;
+                                _lookaheadTarget = -1;
+                                TemplateMatchCachePool.NextDialog();
+                                continue;
+                            }
                         }
                     }
 

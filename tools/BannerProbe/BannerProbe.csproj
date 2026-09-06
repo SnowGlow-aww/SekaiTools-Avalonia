@@ -9,6 +9,12 @@
     <AssemblyName>BannerProbe</AssemblyName>
   </PropertyGroup>
   <ItemGroup>
-    <ProjectReference Include="/Volumes/Amia/Akiyama_mizuki/Coding/tools/SekaiTools-avalonia/SekaiToolsCore/SekaiToolsCore.csproj"/>
+    <ProjectReference Include="../../SekaiToolsCore/SekaiToolsCore.csproj"/>
+  </ItemGroup>
+  <ItemGroup>
+    <Content Include="../../resource/videoProcess/**" Link="videoProcess/%(Filename)%(Extension)"
+             CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="../../resource/videoProcess.json" Link="videoProcess.json"
+             CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 </Project>

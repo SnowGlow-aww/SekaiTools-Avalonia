@@ -269,14 +269,6 @@ public class SubtitleMaker(VideoInfo videoInfo, TemplateManager templateManager,
                 }
                 else
                 {
-                    // 原文 3 行 → 译文块被定位到 Line3(最低锚点，见 GenerateNoneJitterDialogEvents 的 styleName)，
-                    // 其下方已无空间；译文若带 \N 会再折一行、越界叠进日文块（用户反馈：得手动删 \N）。团队成品
-                    // 规范里译文恒为单物理行、靠 1行/2行/3行 样式定位，因此 3 行原文的短译文(未走分隔/过长行分支)
-                    // 必须塌成单行。判定主语必须是 BodyOriginal(含真实 \n)：旧代码用 BodyTranslated——它从 txt 载入、
-                    // 存的是字面 \N 而非真实 \n，LineCount() 恒为 1、塌行从不触发（这正是「\N 不自动删」的回归根因）。
-                    // 口径与下方 styleName 的 Split("\n").Length 完全一致：凡被定位到 Line3 的都塌行。
-                    if (set.Data.BodyOriginal.Split("\n").Length == 3)
-                        set.Data.SetTranslationContent(set.Data.BodyTranslated.TrimAll());
                     dialogEvents.AddRange(GenerateDialogEvent(set));
                 }
             }
@@ -309,14 +301,64 @@ public class SubtitleMaker(VideoInfo videoInfo, TemplateManager templateManager,
             sepSet1.Frames.AddRange(dialogBaseFrameSet.Frames[..sepCount]);
             sepSet2.Frames.AddRange(dialogBaseFrameSet.Frames[sepCount..]);
 
-            var content = dialogBaseFrameSet.Data.FinalContent.TrimAll();
-            // SeparatorContentIndex 是按分隔时的译文长度算的，TrimAll 后内容可能变短（首行空格结尾+Enter
-            // 让次行为空等换行），未夹取会让切片越界抛异常中断整个 ass 导出；夹到合法区间后退化为不分隔而不崩。
-            var sepContentIndex = Math.Clamp(dialogBaseFrameSet.Separate.SeparatorContentIndex, 0, content.Length);
-            sepSet1.Data.BodyTranslated = content[..sepContentIndex];
-            sepSet2.Data.BodyTranslated = content[sepContentIndex..];
+            var rawContent = dialogBaseFrameSet.Data.FinalContent;
+            var (part1, part2) = SplitContentPreservingLinebreaks(rawContent, dialogBaseFrameSet.Separate.SeparatorContentIndex);
+            sepSet1.Data.BodyTranslated = part1;
+            sepSet2.Data.BodyTranslated = part2;
 
             return [sepSet1, sepSet2];
+        }
+
+        static (string part1, string part2) SplitContentPreservingLinebreaks(string content, int separatorContentIndex)
+        {
+            if (string.IsNullOrEmpty(content) || separatorContentIndex <= 0)
+                return ("", content ?? "");
+
+            var charCount = 0;
+            var splitIndex = content.Length;
+
+            for (var i = 0; i < content.Length; i++)
+            {
+                if (content[i] == '\\' && i + 1 < content.Length && (content[i + 1] == 'N' || content[i + 1] == 'n' || content[i + 1] == 'R'))
+                {
+                    i++;
+                    continue;
+                }
+                if (content[i] == '\r' || content[i] == '\n')
+                {
+                    continue;
+                }
+
+                charCount++;
+                if (charCount == separatorContentIndex)
+                {
+                    splitIndex = i + 1;
+                    break;
+                }
+            }
+
+            var part1 = content[..splitIndex].TrimEnd();
+            var rest = content[splitIndex..];
+            while (true)
+            {
+                if (rest.StartsWith("\\N") || rest.StartsWith("\\n") || rest.StartsWith("\\R"))
+                {
+                    rest = rest[2..];
+                }
+                else if (rest.StartsWith("\r\n"))
+                {
+                    rest = rest[2..];
+                }
+                else if (rest.StartsWith("\n") || rest.StartsWith("\r") || rest.StartsWith(" "))
+                {
+                    rest = rest[1..];
+                }
+                else
+                {
+                    break;
+                }
+            }
+            return (part1, rest);
         }
 
         IEnumerable<SubtitleEvent> GenerateDialogEvent(DialogBaseFrameSet set)
@@ -333,7 +375,17 @@ public class SubtitleMaker(VideoInfo videoInfo, TemplateManager templateManager,
             var content = dialogBaseFrameSet.Data.FinalContent;
             var characterName = dialogBaseFrameSet.Data.FinalCharacter;
             var originLineCount = dialogBaseFrameSet.Data.BodyOriginal.Split("\n").Length;
-            var styleName = "Line" + originLineCount;
+            var lines = content.Split(new[] { "\\N", "\\n", "\n" }, StringSplitOptions.None);
+            var styleLine = originLineCount;
+            if (lines.Length >= 2 && originLineCount == 3)
+            {
+                styleLine = 2;
+            }
+            else if (lines.Length == 1 && originLineCount == 3 && dialogBaseFrameSet.StartIndex() > 0)
+            {
+                styleLine = 1;
+            }
+            var styleName = "Line" + styleLine;
 
             var startTime = dialogBaseFrameSet.StartTime();
             var endTime = dialogBaseFrameSet.EndTime();
@@ -361,8 +413,17 @@ public class SubtitleMaker(VideoInfo videoInfo, TemplateManager templateManager,
             var content = dialogBaseFrameSet.Data.FinalContent;
             var characterName = dialogBaseFrameSet.Data.FinalCharacter;
             var originLineCount = dialogBaseFrameSet.Data.BodyOriginal.Split("\n").Length;
-
-            var styleName = "Line" + originLineCount;
+            var lines = content.Split(new[] { "\\N", "\\n", "\n" }, StringSplitOptions.None);
+            var styleLine = originLineCount;
+            if (lines.Length >= 2 && originLineCount == 3)
+            {
+                styleLine = 2;
+            }
+            else if (lines.Length == 1 && originLineCount == 3 && dialogBaseFrameSet.StartIndex() > 0)
+            {
+                styleLine = 1;
+            }
+            var styleName = "Line" + styleLine;
             var styles = MakeDialogStyles();
             var style = styles.Find(s => s.Name == styleName)!;
 
