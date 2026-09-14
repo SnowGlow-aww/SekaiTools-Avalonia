@@ -3,6 +3,7 @@ using System.Drawing;
 using System.Globalization;
 using Emgu.CV;
 using Emgu.CV.CvEnum;
+using SekaiToolsCore;
 using SekaiToolsCore.Match.TemplateMatcher;
 using SekaiToolsCore.Process.Config;
 using SekaiToolsCore.Process.FrameSet;
@@ -164,8 +165,74 @@ internal static class Program
         TestFrame(img350, "sub_350_cross_talk58_speaker", new[] { "『♪————" }, "中学生の彰人・中学生の冬弥");
     }
 
+    private static void RunAreatalkTest(string videoPath, string scriptPath, string translatePath = "", string outAssPath = "")
+    {
+        var vInfo = new VideoInfo(videoPath);
+        var fps = vInfo.Fps.Fps();
+        var tm = new TemplateManager(vInfo.Resolution);
+        var story = SekaiStory.FromFile(scriptPath, translatePath);
+        var config = new Config(videoPath, scriptPath, translatePath, matchingThreshold: new MatchingThreshold
+        {
+            DialogDropGraceSeconds = 0.30,
+            DialogNametagNormal = 0.80,
+            DialogNametagSpecial = 0.60,
+            DialogContentNormal = 0.80,
+            DialogContentSpecial = 0.60,
+            BannerNormal = 0.80,
+            MarkerNormal = 0.80
+        });
+
+        var matcher = new DialogTemplateMatcher(vInfo, story, tm, config);
+        using var cap = new VideoCapture(videoPath);
+        var frame = new Mat();
+        var sw = Stopwatch.StartNew();
+        var f = 0;
+
+        Console.WriteLine($"=== Testing Areatalk: video={Path.GetFileName(videoPath)} script={Path.GetFileName(scriptPath)} ===");
+        Console.WriteLine($"Resolution: {vInfo.Resolution.Width}x{vInfo.Resolution.Height} ratio={vInfo.FrameRatio:F3} totalFrames={vInfo.FrameCount} fps={fps}");
+        Console.WriteLine($"Talk count in script: {matcher.Set.Count}");
+
+        while (!matcher.Finished && cap.Read(frame))
+        {
+            if (frame.IsEmpty) break;
+            var curIdx = matcher.LastNotProcessedIndex();
+            matcher.Process(frame, f);
+            f++;
+        }
+
+        Console.WriteLine($"Processed {f} frames in {sw.ElapsedMilliseconds}ms ({f * 1000.0 / Math.Max(1, sw.ElapsedMilliseconds):F1} fps)");
+        var matchedCount = 0;
+        for (var i = 0; i < matcher.Set.Count; i++)
+        {
+            var d = matcher.Set[i];
+            var isMatched = !d.IsEmpty();
+            if (isMatched) matchedCount++;
+            var body = d.Data.BodyOriginal.Replace("\n", "\\N");
+            var trans = d.Data.BodyTranslated.Replace("\n", "\\N");
+            Console.WriteLine($"[{i}] {d.Data.CharacterOriginal}: {body} (TR: {trans}) -> {(isMatched ? $"MATCHED [{d.StartIndex()}..{d.EndIndex()}] ({d.StartTime():hh\\:mm\\:ss\\.ff}->{d.EndTime():hh\\:mm\\:ss\\.ff})" : "EMPTY / NOT MATCHED")}");
+        }
+        Console.WriteLine($"Total: {matchedCount}/{matcher.Set.Count} matched.");
+
+        if (!string.IsNullOrEmpty(outAssPath) && matchedCount > 0)
+        {
+            var sm = new SubtitleMaker(vInfo, tm, config);
+            var ass = sm.Make(matcher.Set, [], []);
+            ass.Save(outAssPath);
+            Console.WriteLine($"Exported ASS to {outAssPath}");
+        }
+    }
+
     public static void Main(string[] args)
     {
+        if (args.Length > 0 && args[0] == "test-areatalk")
+        {
+            var v = args.Length > 1 ? args[1] : "/Users/amia/Downloads/215/event_215_场景对话002.mp4";
+            var s = args.Length > 2 ? args[2] : "/Users/amia/Downloads/215/areatalk_2592_areatalk_ev_shuffle_64_005.json";
+            var t = args.Length > 3 ? args[3] : "";
+            var a = args.Length > 4 ? args[4] : "";
+            RunAreatalkTest(v, s, t, a);
+            return;
+        }
         if (args.Length > 0 && args[0] == "test-note")
         {
             TestNote();

@@ -269,6 +269,8 @@ public class SubtitleMaker(VideoInfo videoInfo, TemplateManager templateManager,
                 }
                 else
                 {
+                    if (set.Data.BodyOriginal.Split("\n").Length == 3)
+                        set.Data.SetTranslationContent(set.Data.BodyTranslated.TrimAll());
                     dialogEvents.AddRange(GenerateDialogEvent(set));
                 }
             }
@@ -293,7 +295,10 @@ public class SubtitleMaker(VideoInfo videoInfo, TemplateManager templateManager,
 
         List<DialogBaseFrameSet> SeparateDialogSet(DialogBaseFrameSet dialogBaseFrameSet)
         {
+            var frameCount = dialogBaseFrameSet.Frames.Count;
             var sepCount = dialogBaseFrameSet.Separate.SeparateFrame - dialogBaseFrameSet.StartIndex();
+            if (sepCount <= 0 || sepCount >= frameCount)
+                sepCount = frameCount / 2;
 
             var sepSet1 = new DialogBaseFrameSet((DialogStoryEvent)dialogBaseFrameSet.Data.Clone(), videoInfo.Fps);
             var sepSet2 = new DialogBaseFrameSet((DialogStoryEvent)dialogBaseFrameSet.Data.Clone(), videoInfo.Fps);
@@ -301,64 +306,14 @@ public class SubtitleMaker(VideoInfo videoInfo, TemplateManager templateManager,
             sepSet1.Frames.AddRange(dialogBaseFrameSet.Frames[..sepCount]);
             sepSet2.Frames.AddRange(dialogBaseFrameSet.Frames[sepCount..]);
 
-            var rawContent = dialogBaseFrameSet.Data.FinalContent;
-            var (part1, part2) = SplitContentPreservingLinebreaks(rawContent, dialogBaseFrameSet.Separate.SeparatorContentIndex);
-            sepSet1.Data.BodyTranslated = part1;
-            sepSet2.Data.BodyTranslated = part2;
+            var content = dialogBaseFrameSet.Data.FinalContent.TrimAll();
+            var contentIdx = dialogBaseFrameSet.Separate.SeparatorContentIndex;
+            if (contentIdx <= 0 || contentIdx >= content.Length)
+                contentIdx = content.Length / 2;
+            sepSet1.Data.BodyTranslated = content[..contentIdx];
+            sepSet2.Data.BodyTranslated = content[contentIdx..];
 
             return [sepSet1, sepSet2];
-        }
-
-        static (string part1, string part2) SplitContentPreservingLinebreaks(string content, int separatorContentIndex)
-        {
-            if (string.IsNullOrEmpty(content) || separatorContentIndex <= 0)
-                return ("", content ?? "");
-
-            var charCount = 0;
-            var splitIndex = content.Length;
-
-            for (var i = 0; i < content.Length; i++)
-            {
-                if (content[i] == '\\' && i + 1 < content.Length && (content[i + 1] == 'N' || content[i + 1] == 'n' || content[i + 1] == 'R'))
-                {
-                    i++;
-                    continue;
-                }
-                if (content[i] == '\r' || content[i] == '\n')
-                {
-                    continue;
-                }
-
-                charCount++;
-                if (charCount == separatorContentIndex)
-                {
-                    splitIndex = i + 1;
-                    break;
-                }
-            }
-
-            var part1 = content[..splitIndex].TrimEnd();
-            var rest = content[splitIndex..];
-            while (true)
-            {
-                if (rest.StartsWith("\\N") || rest.StartsWith("\\n") || rest.StartsWith("\\R"))
-                {
-                    rest = rest[2..];
-                }
-                else if (rest.StartsWith("\r\n"))
-                {
-                    rest = rest[2..];
-                }
-                else if (rest.StartsWith("\n") || rest.StartsWith("\r") || rest.StartsWith(" "))
-                {
-                    rest = rest[1..];
-                }
-                else
-                {
-                    break;
-                }
-            }
-            return (part1, rest);
         }
 
         IEnumerable<SubtitleEvent> GenerateDialogEvent(DialogBaseFrameSet set)
@@ -375,17 +330,7 @@ public class SubtitleMaker(VideoInfo videoInfo, TemplateManager templateManager,
             var content = dialogBaseFrameSet.Data.FinalContent;
             var characterName = dialogBaseFrameSet.Data.FinalCharacter;
             var originLineCount = dialogBaseFrameSet.Data.BodyOriginal.Split("\n").Length;
-            var lines = content.Split(new[] { "\\N", "\\n", "\n" }, StringSplitOptions.None);
-            var styleLine = originLineCount;
-            if (lines.Length >= 2 && originLineCount == 3)
-            {
-                styleLine = 2;
-            }
-            else if (lines.Length == 1 && originLineCount == 3 && dialogBaseFrameSet.StartIndex() > 0)
-            {
-                styleLine = 1;
-            }
-            var styleName = "Line" + styleLine;
+            var styleName = "Line" + originLineCount;
 
             var startTime = dialogBaseFrameSet.StartTime();
             var endTime = dialogBaseFrameSet.EndTime();
@@ -413,17 +358,7 @@ public class SubtitleMaker(VideoInfo videoInfo, TemplateManager templateManager,
             var content = dialogBaseFrameSet.Data.FinalContent;
             var characterName = dialogBaseFrameSet.Data.FinalCharacter;
             var originLineCount = dialogBaseFrameSet.Data.BodyOriginal.Split("\n").Length;
-            var lines = content.Split(new[] { "\\N", "\\n", "\n" }, StringSplitOptions.None);
-            var styleLine = originLineCount;
-            if (lines.Length >= 2 && originLineCount == 3)
-            {
-                styleLine = 2;
-            }
-            else if (lines.Length == 1 && originLineCount == 3 && dialogBaseFrameSet.StartIndex() > 0)
-            {
-                styleLine = 1;
-            }
-            var styleName = "Line" + styleLine;
+            var styleName = "Line" + originLineCount;
             var styles = MakeDialogStyles();
             var style = styles.Find(s => s.Name == styleName)!;
 

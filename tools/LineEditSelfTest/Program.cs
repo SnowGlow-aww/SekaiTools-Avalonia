@@ -102,9 +102,9 @@ finally
     File.Delete(relaxedTranslationPath);
 }
 
-DialogBaseFrameSet MakeSet(string translation)
+DialogBaseFrameSet MakeSet(string translation, string original = "一\n二")
 {
-    var data = new DialogStoryEvent(0, "一\n二\n三", 0, "测试", false, false)
+    var data = new DialogStoryEvent(0, original, 0, "测试", false, false)
     {
         BodyTranslated = translation,
     };
@@ -116,6 +116,7 @@ var actualNewline = MakeSet("前半\n后半");
 Check("constructor-real-newline-index", actualNewline.Separate.SeparatorContentIndex, 2);
 Check("constructor-real-newline-enabled", actualNewline.UseSeparator, false);
 Check("constructor-literal-N-enabled", MakeSet("前半\\N后半").UseSeparator, false);
+Check("constructor-3line-original-enabled", MakeSet("前半\\N后半", "一\n二\n三").UseSeparator, true);
 
 // 模拟截图：先有旧分割点，再把译文改为在更后面的 \N 处断开；新值必须覆盖旧值。
 var edited = MakeSet("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ABCD");
