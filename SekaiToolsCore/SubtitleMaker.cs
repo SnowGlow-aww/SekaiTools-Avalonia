@@ -337,7 +337,7 @@ public class SubtitleMaker(VideoInfo videoInfo, TemplateManager templateManager,
 
             var body = MakeDialogTypewriter(content);
 
-            var dialogItem = SubtitleEvent.Dialog(body, startTime, endTime, styleName);
+            var dialogItem = SubtitleEvent.Dialog(body, startTime, endTime, styleName, name: characterName);
 
             int nameTagWidth;
             using (var nameTag = GetNameTag(dialogBaseFrameSet.Data.CharacterOriginal))
@@ -383,7 +383,7 @@ public class SubtitleMaker(VideoInfo videoInfo, TemplateManager templateManager,
                 if (lastPosition.X == x && lastPosition.Y == y && body == dialogEvents[^1].Text)
                     dialogEvents[^1].End = frame.EndTime();
                 else
-                    dialogEvents.Add(SubtitleEvent.Dialog(body, frame.StartTime(), frame.EndTime(), styleName));
+                    dialogEvents.Add(SubtitleEvent.Dialog(body, frame.StartTime(), frame.EndTime(), styleName, name: characterName));
 
                 if (lastPosition.X == x && lastPosition.Y == y && body == characterEvents[^1].Text)
                 {
