@@ -306,14 +306,81 @@ public class SubtitleMaker(VideoInfo videoInfo, TemplateManager templateManager,
             sepSet1.Frames.AddRange(dialogBaseFrameSet.Frames[..sepCount]);
             sepSet2.Frames.AddRange(dialogBaseFrameSet.Frames[sepCount..]);
 
-            var content = dialogBaseFrameSet.Data.FinalContent.TrimAll();
-            var contentIdx = dialogBaseFrameSet.Separate.SeparatorContentIndex;
-            if (contentIdx <= 0 || contentIdx >= content.Length)
-                contentIdx = content.Length / 2;
-            sepSet1.Data.BodyTranslated = content[..contentIdx];
-            sepSet2.Data.BodyTranslated = content[contentIdx..];
+            var rawContent = dialogBaseFrameSet.Data.FinalContent;
+            var (part1, part2) = SplitContentPreservingLinebreaks(rawContent, dialogBaseFrameSet.Separate.SeparatorContentIndex);
+            sepSet1.Data.BodyTranslated = part1;
+            sepSet2.Data.BodyTranslated = part2;
 
             return [sepSet1, sepSet2];
+        }
+
+        static (string part1, string part2) SplitContentPreservingLinebreaks(string content, int separatorContentIndex)
+        {
+            if (string.IsNullOrEmpty(content))
+                return ("", "");
+
+            var totalChars = 0;
+            for (var i = 0; i < content.Length; i++)
+            {
+                if (content[i] == '\\' && i + 1 < content.Length && (content[i + 1] == 'N' || content[i + 1] == 'n' || content[i + 1] == 'R'))
+                {
+                    i++;
+                    continue;
+                }
+                if (content[i] == '\r' || content[i] == '\n')
+                    continue;
+
+                totalChars++;
+            }
+
+            if (separatorContentIndex <= 0 || separatorContentIndex >= totalChars)
+                separatorContentIndex = Math.Max(1, totalChars / 2);
+
+            var charCount = 0;
+            var splitIndex = content.Length;
+
+            for (var i = 0; i < content.Length; i++)
+            {
+                if (content[i] == '\\' && i + 1 < content.Length && (content[i + 1] == 'N' || content[i + 1] == 'n' || content[i + 1] == 'R'))
+                {
+                    i++;
+                    continue;
+                }
+                if (content[i] == '\r' || content[i] == '\n')
+                {
+                    continue;
+                }
+
+                charCount++;
+                if (charCount == separatorContentIndex)
+                {
+                    splitIndex = i + 1;
+                    break;
+                }
+            }
+
+            var part1 = content[..splitIndex].TrimEnd();
+            var rest = content[splitIndex..];
+            while (true)
+            {
+                if (rest.StartsWith("\\N") || rest.StartsWith("\\n") || rest.StartsWith("\\R"))
+                {
+                    rest = rest[2..];
+                }
+                else if (rest.StartsWith("\r\n"))
+                {
+                    rest = rest[2..];
+                }
+                else if (rest.StartsWith("\n") || rest.StartsWith("\r") || rest.StartsWith(" "))
+                {
+                    rest = rest[1..];
+                }
+                else
+                {
+                    break;
+                }
+            }
+            return (part1, rest);
         }
 
         IEnumerable<SubtitleEvent> GenerateDialogEvent(DialogBaseFrameSet set)
