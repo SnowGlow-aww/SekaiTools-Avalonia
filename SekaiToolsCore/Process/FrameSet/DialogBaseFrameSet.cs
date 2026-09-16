@@ -49,7 +49,8 @@ public partial class DialogBaseFrameSet : BaseFrameSet
     public bool NeedSetSeparator => Data.BodyTranslated != string.Empty &&
                                     (Data.BodyOriginal.LineCount() == 3 ||
                                      Data.BodyTranslated.Split(new[] { "\\N", "\\n", "\n" }, StringSplitOptions.None).Length >= 3 ||
-                                     Data.BodyTranslated.TrimAll().Length > 37);
+                                     (Data.BodyTranslated.Split(new[] { "\\N", "\\n", "\n" }, StringSplitOptions.None).Length == 1 &&
+                                      Data.BodyTranslated.TrimAll().Length > 37));
 
     public bool UseSeparator { get; set; }
 

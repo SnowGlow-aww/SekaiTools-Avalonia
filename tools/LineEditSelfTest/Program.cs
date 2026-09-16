@@ -118,6 +118,14 @@ Check("constructor-real-newline-enabled", actualNewline.UseSeparator, false);
 Check("constructor-literal-N-enabled", MakeSet("前半\\N后半").UseSeparator, false);
 Check("constructor-3line-original-enabled", MakeSet("前半\\N后半", "一\n二\n三").UseSeparator, true);
 
+// 2行日文原文配 2行中文译文（即使含省略号扩展使得总字数 > 37）绝不激活分轴，确保单轴双行正常渲染（Image #1 逻辑）
+var neneTwoLine = MakeSet("（寄件人是......《月刊戏剧生活》？\\N经常做戏剧特辑，是我常买的那本杂志。）", "差出人は......『月刊シアター・ライフ』？\n演劇の特集をやってて、よく買ってる雑誌だ");
+Check("2line-original-2line-trans-disabled-even-if-over37", neneTwoLine.UseSeparator, false);
+
+// 3行日文原文配相同译文必须激活分轴
+var neneThreeLine = MakeSet("（寄件人是......《月刊戏剧生活》？\\N经常做戏剧特辑，是我常买的那本杂志。）", "一\n二\n三");
+Check("3line-original-same-trans-enabled", neneThreeLine.UseSeparator, true);
+
 // 模拟截图：先有旧分割点，再把译文改为在更后面的 \N 处断开；新值必须覆盖旧值。
 var edited = MakeSet("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ABCD");
 edited.SetSeparator(200, 7);
