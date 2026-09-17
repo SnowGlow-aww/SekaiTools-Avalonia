@@ -85,7 +85,7 @@ public class LineDialogModel : LineModel
             Check = CheckContent(v);
             SetProperty(v);
             LineCount = (v + "\n").LineCount();
-            MaxLineLength = (v + "\n").MaxLineLength();
+            MaxLineLength = (int)Math.Ceiling((v + "\n").MaxLineVisualWeight());
             RefreshContentDiff();
             OnPropertyChanged(nameof(HasCheck));
             OnPropertyChanged(nameof(HasTranslatedContent));

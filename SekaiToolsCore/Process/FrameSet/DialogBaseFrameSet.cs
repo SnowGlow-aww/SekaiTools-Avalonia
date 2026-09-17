@@ -50,7 +50,7 @@ public partial class DialogBaseFrameSet : BaseFrameSet
                                     (Data.BodyOriginal.LineCount() == 3 ||
                                      Data.BodyTranslated.Split(new[] { "\\N", "\\n", "\n" }, StringSplitOptions.None).Length >= 3 ||
                                      (Data.BodyTranslated.Split(new[] { "\\N", "\\n", "\n" }, StringSplitOptions.None).Length == 1 &&
-                                      Data.BodyTranslated.TrimAll().Length > 37));
+                                      Data.BodyTranslated.VisualWeight() > 37.0));
 
     public bool UseSeparator { get; set; }
 
@@ -73,7 +73,7 @@ public partial class DialogBaseFrameSet : BaseFrameSet
             : (int?)null;
         var separatorContentIndex = validExplicitSeparatorContentIndex
                                     ?? existingSeparatorContentIndex
-                                    ?? contentLength / 2;
+                                    ?? text.FindSmartSeparatorContentIndex();
         separatorContentIndex = contentLength > 1
             ? Math.Clamp(separatorContentIndex, 1, contentLength - 1)
             : Math.Max(0, separatorContentIndex);

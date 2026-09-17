@@ -168,14 +168,14 @@ public partial class DialogLineCardViewModel : LineCardViewModelBase
 
         var frameDurationMs = 1000.0 / _fps.Fps();
         var part1FrameDurationMs = (SeparateFrame - Set.StartIndex()) * frameDurationMs;
-        if (ContentPart1.Length * CharTimeMs > part1FrameDurationMs)
+        if (ContentPart1.VisualWeight() * CharTimeMs > part1FrameDurationMs)
         {
             PromptWarning = "第一行文字将无法显示完全";
             return;
         }
 
         var part2FrameDurationMs = (Set.EndIndex() - SeparateFrame) * frameDurationMs;
-        if (ContentPart2.Length * CharTimeMs > part2FrameDurationMs)
+        if (ContentPart2.VisualWeight() * CharTimeMs > part2FrameDurationMs)
         {
             PromptWarning = "第二行文字将无法显示完全";
             return;

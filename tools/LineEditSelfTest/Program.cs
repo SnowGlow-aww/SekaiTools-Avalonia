@@ -126,6 +126,30 @@ Check("2line-original-2line-trans-disabled-even-if-over37", neneTwoLine.UseSepar
 var neneThreeLine = MakeSet("（寄件人是......《月刊戏剧生活》？\\N经常做戏剧特辑，是我常买的那本杂志。）", "一\n二\n三");
 Check("3line-original-same-trans-enabled", neneThreeLine.UseSeparator, true);
 
+// 英文与西文文本视觉加权判定：ASCII 字符计 0.5 权重，不能按 1:1 误判为超长单行
+Check("visual-weight-ascii", "Hello world!".VisualWeight(), 6.0); // 12 ascii chars = 6.0
+Check("visual-weight-cjk", "你好世界！".VisualWeight(), 5.0); // 5 cjk chars = 5.0
+Check("visual-weight-mixed", "世界 SEKAI".VisualWeight(), 5.0); // 2 cjk (2.0) + 1 space (0.5) + 5 ascii (2.5) = 5.0
+
+// 52 字符的英文单行台词（视觉权重 26.0 <= 37.0），绝不误触发强制分轴
+var engSingleLine = MakeSet("Welcome to Phoenix Wonderland! Let's sing and dance!", "一");
+Check("english-single-line-under-weight-disabled", engSingleLine.UseSeparator, false);
+
+// 45 字符的中英混排单行台词（视觉权重 18 + 27*0.5 = 31.5 <= 37.0），绝不误触发强制分轴
+var mixedLine = MakeSet("我们明天一起去听 Leo/need 和 Vivid BAD SQUAD 的现场演出吧！", "一");
+Check("mixed-single-line-under-weight-disabled", mixedLine.UseSeparator, false);
+
+// 88 字符的超长英文单行台词（视觉权重 44.0 > 37.0），必须正确激活分轴
+var overlongEngLine = MakeSet("Welcome to Phoenix Wonderland! Let's sing and dance together with everyone all day long!", "一");
+Check("english-single-line-over-weight-enabled", overlongEngLine.UseSeparator, true);
+// 且自动切分点必须切在半角空格/标点等词界处，不能在单词内部劈碎（例如 'together' 不能被切开）
+var smartCutIndex = "Welcome to Phoenix Wonderland! Let's sing and dance together with everyone all day long!".FindSmartSeparatorContentIndex();
+var cleanEng = "Welcome to Phoenix Wonderland! Let's sing and dance together with everyone all day long!".TrimAll();
+var isWordBoundary = smartCutIndex > 0 && smartCutIndex < cleanEng.Length &&
+    (cleanEng[smartCutIndex - 1] == ' ' || cleanEng[smartCutIndex] == ' ' ||
+     char.IsPunctuation(cleanEng[smartCutIndex - 1]) || char.IsPunctuation(cleanEng[smartCutIndex]));
+Check("smart-separator-english-word-boundary", isWordBoundary, true);
+
 // 模拟截图：先有旧分割点，再把译文改为在更后面的 \N 处断开；新值必须覆盖旧值。
 var edited = MakeSet("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ABCD");
 edited.SetSeparator(200, 7);
